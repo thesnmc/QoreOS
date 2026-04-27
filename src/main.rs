@@ -18,6 +18,7 @@ pub mod nvme;
 pub mod mouse;
 pub mod fat32;
 pub mod usermode;
+pub mod hda;
 
 #[repr(C)]
 pub struct BootInfo {
@@ -35,6 +36,7 @@ pub struct UefiMemoryDescriptor {
 
 pub static mut NET_CARD: Option<e1000::E1000> = None;
 pub static mut NVME_DRIVE: Option<nvme::Nvme> = None; 
+pub static mut AUDIO_DRIVE: Option<hda::IntelHda> = None;
 
 // --- THE RING-3 SANDBOX APP ---
 // This runs entirely in isolated User Mode. 
@@ -65,6 +67,10 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     let mut nvme_bar0: u64 = 0; 
     let mut xhci_found = false;
     let mut _xhci_bar0: u64 = 0; 
+    
+    // Audio hardware tracking
+    let mut hda_found = false;
+    let mut hda_bar0: u64 = 0;
 
     let mut sector_data_str = alloc::string::String::new();
 
@@ -104,6 +110,7 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                             let subclass = unsafe { core::ptr::read_volatile((pci_addr + 0x0A) as *const u8) };
                             let prog_if = unsafe { core::ptr::read_volatile((pci_addr + 0x09) as *const u8) };
                             
+                            // --- NVMe Check ---
                             if class_code == 0x01 && subclass == 0x08 { 
                                 nvme_found = true; 
                                 let bar0_raw = unsafe { core::ptr::read_volatile((pci_addr + 0x10) as *const u32) };
@@ -122,6 +129,26 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                                 unsafe { core::ptr::write_volatile(cmd_addr, cmd); }
                             }
                             
+                            // --- Intel HDA Check ---
+                            if class_code == 0x04 && subclass == 0x03 {
+                                hda_found = true;
+                                let bar0_raw = unsafe { core::ptr::read_volatile((pci_addr + 0x10) as *const u32) };
+                                let bar_type = (bar0_raw >> 1) & 0x03;
+                                
+                                if bar_type == 2 { // 64-bit BAR
+                                    let bar1_raw = unsafe { core::ptr::read_volatile((pci_addr + 0x14) as *const u32) };
+                                    hda_bar0 = ((bar1_raw as u64) << 32) | ((bar0_raw & 0xFFFFFFF0) as u64);
+                                } else { // 32-bit BAR
+                                    hda_bar0 = (bar0_raw & 0xFFFFFFF0) as u64;
+                                }
+
+                                let cmd_addr = (pci_addr + 0x04) as *mut u16;
+                                let mut cmd = unsafe { core::ptr::read_volatile(cmd_addr) };
+                                cmd |= (1 << 1) | (1 << 2); 
+                                unsafe { core::ptr::write_volatile(cmd_addr, cmd); }
+                            }
+                            
+                            // --- xHCI USB Check ---
                             if class_code == 0x0C && subclass == 0x03 && prog_if == 0x30 { 
                                 xhci_found = true; 
                                 let bar0_raw = unsafe { core::ptr::read_volatile((pci_addr + 0x10) as *const u32) };
@@ -177,6 +204,7 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         mouse::init();
         x86_64::instructions::interrupts::enable();
 
+        // COMPOSITOR INIT
         compositor::init(boot_info);
         compositor::fill_rect(0, 0, compositor::SERVER.width, compositor::SERVER.height, 0xFFFFFF);
         compositor::fill_rect(0, 0, compositor::SERVER.width, 40, 0x1E293B);
@@ -185,6 +213,7 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         compositor::terminal_print("INIT: Core 0 (BSP) Online.\n", 0x10B981);
         compositor::terminal_print("INIT: APIC Interrupt Routing Established.\n", 0x10B981);
         
+        // NVME INIT
         if nvme_found && nvme_bar0 != 0 { 
             compositor::terminal_print("ECAM: NVMe Direct Storage Controller Found!\n", 0x3B82F6); 
             let mut drive = nvme::Nvme::new(nvme_bar0);
@@ -192,14 +221,14 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
             drive.identify_controller();
             
             let sector_0 = drive.read_sector(0);
-            let bpb = &*(sector_0.as_ptr() as *const fat32::Fat32BootSector);
+            let bpb = unsafe { &*(sector_0.as_ptr() as *const fat32::Fat32BootSector) };
             
             let volume = fat32::Fat32Volume::new(bpb);
             
             let root_lba = volume.cluster_to_lba(volume.root_cluster);
             if root_lba > 0 {
                 let root_sector = drive.read_sector(root_lba);
-                let entries = core::slice::from_raw_parts(root_sector.as_ptr() as *const fat32::Fat32DirEntry, 512 / 32);
+                let entries = unsafe { core::slice::from_raw_parts(root_sector.as_ptr() as *const fat32::Fat32DirEntry, 512 / 32) };
                 
                 let mut payload_cluster = 0;
                 for entry in entries {
@@ -230,6 +259,13 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
             NVME_DRIVE = Some(drive);
         }
 
+        // AUDIO INIT (Perfectly timed after GUI is active)
+        if hda_found && hda_bar0 != 0 {
+            let mut hda = hda::IntelHda::new(hda_bar0);
+            hda.init();
+            AUDIO_DRIVE = Some(hda);
+        }
+
         if xhci_found { compositor::terminal_print("ECAM: xHCI Extensible Host Controller Found!\n", 0x3B82F6); }
         
         compositor::terminal_print("SMP: INIT-SIPI IPI Broadcast Transmitted to AP Cores.\n", 0x3B82F6);
@@ -247,7 +283,8 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     // ---------------------------------------------------------
     let mut old_mbtn = 0;
 
-    let mut desktop_win = compositor::Window::new(100, 200, 600, 250, "EDGECORE DIAGNOSTICS", 0x334155);
+    // UPGRADE: Height increased to 300px to fit Audio Status telemetry
+    let mut desktop_win = compositor::Window::new(100, 200, 600, 300, "EDGECORE DIAGNOSTICS", 0x334155);
     
     let mut is_dragging = false;
     let mut drag_offset_x = 0;
@@ -270,7 +307,7 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
             if my >= compositor::SERVER.height as i32 { my = compositor::SERVER.height as i32 - 10; mouse::MOUSE_Y.store(my, core::sync::atomic::Ordering::Relaxed); }
 
             let drop_btn_x = desktop_win.x as usize + 20;
-            let drop_btn_y = desktop_win.y as usize + 170;
+            let drop_btn_y = desktop_win.y as usize + 240; // Shifted button down
 
             if desktop_win.is_open {
                 let close_x = desktop_win.x + desktop_win.width as i32 - 20;
@@ -280,7 +317,6 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                     desktop_win.is_open = false;
                     is_dragging = false;
                 } 
-                // --- THE RING-3 IGNITION TRIGGER ---
                 else if click_just_pressed && mx >= drop_btn_x as i32 && mx <= (drop_btn_x + 380) as i32 && my >= drop_btn_y as i32 && my <= (drop_btn_y + 24) as i32 {
                     compositor::terminal_print("\n> [WARNING] EJECTING FROM KERNEL MODE. DROPPING TO RING-3...\n", 0xEF4444);
                     if let Some(ref canvas) = compositor::SERVER.terminal_layer { compositor::blit_canvas(canvas); }
@@ -291,8 +327,7 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                     let code_selector = gdt::GDT.1.user_code.0;
                     let data_selector = gdt::GDT.1.user_data.0;
 
-                    // Execute the drop!
-                    usermode::drop_to_usermode(code_selector, data_selector, ring3_user_task as u64, stack_ptr);
+                    usermode::drop_to_usermode(code_selector, data_selector, ring3_user_task as *const () as u64, stack_ptr);
                 }
                 else if left_click {
                     if !is_dragging {
@@ -335,9 +370,14 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                 let nvme_text = alloc::format!("STORAGE: NVME CONTROLLER {}", nvme_status);
                 compositor::draw_string(text_x, text_y + 80, &nvme_text, 0x3B82F6, 1);
 
+                // --- UPGRADE: LIVE HDA AUDIO STATUS GUI ---
+                let hda_status = if hda_found { "CORB/RIRB DMA ONLINE" } else { "OFFLINE" };
+                let hda_text = alloc::format!("AUDIO: INTEL HDA {}", hda_status);
+                compositor::draw_string(text_x, text_y + 100, &hda_text, 0x3B82F6, 1);
+
                 if sector_data_str.len() > 0 {
-                    compositor::draw_string(text_x, text_y + 110, "EXTRACTED HEX PAYLOAD:", 0x10B981, 1);
-                    compositor::draw_string(text_x, text_y + 130, &sector_data_str, 0xF59E0B, 1);
+                    compositor::draw_string(text_x, text_y + 130, "FAT32 PAYLOAD DECRYPTED:", 0x10B981, 1);
+                    compositor::draw_string(text_x, text_y + 150, &sector_data_str, 0xF59E0B, 1);
                 }
 
                 // DRAW THE RED BUTTON
