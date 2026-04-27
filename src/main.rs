@@ -260,9 +260,11 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         }
 
         // AUDIO INIT (Perfectly timed after GUI is active)
+        // --- INTEL HDA INITIALIZED (POST-COMPOSITOR) ---
         if hda_found && hda_bar0 != 0 {
             let mut hda = hda::IntelHda::new(hda_bar0);
             hda.init();
+            hda.play_tone(); // <--- NEW: PLAY THE TONE!
             AUDIO_DRIVE = Some(hda);
         }
 
@@ -371,7 +373,7 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                 compositor::draw_string(text_x, text_y + 80, &nvme_text, 0x3B82F6, 1);
 
                 // --- UPGRADE: LIVE HDA AUDIO STATUS GUI ---
-                let hda_status = if hda_found { "CORB/RIRB DMA ONLINE" } else { "OFFLINE" };
+                let hda_status = if hda_found { "PLAYING 440HZ TONE" } else { "OFFLINE" };
                 let hda_text = alloc::format!("AUDIO: INTEL HDA {}", hda_status);
                 compositor::draw_string(text_x, text_y + 100, &hda_text, 0x3B82F6, 1);
 
