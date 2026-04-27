@@ -6,6 +6,7 @@ use x86_64::instructions::port::Port;
 
 const TIMER_INT: u8 = 32;
 const KEYBOARD_INT: u8 = 33;
+const MOUSE_INT: u8 = 44; // NEW: Hardware Vector for the Mouse
 const SYSCALL_INT: u8 = 0x80;
 
 pub static mut LAPIC_BASE: u64 = 0;
@@ -20,6 +21,10 @@ lazy_static! {
             idt[SYSCALL_INT as usize].set_handler_fn(syscall_handler)
                 .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
             idt[KEYBOARD_INT as usize].set_handler_fn(keyboard_interrupt_handler)
+                .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+            
+            // NEW: Register the Lock-Free Mouse Handler
+            idt[MOUSE_INT as usize].set_handler_fn(mouse_interrupt_handler)
                 .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
         }
         idt[TIMER_INT as usize].set_handler_fn(timer_interrupt_handler);
@@ -41,9 +46,18 @@ pub unsafe fn init_apic(lapic: u64, ioapic: u64) {
 
     let ioregsel = ioapic as *mut u32;
     let iowin = (ioapic + 0x10) as *mut u32;
+    
+    // Route Keyboard (IRQ 1 -> Vector 33)
     core::ptr::write_volatile(ioregsel, 0x12);
     core::ptr::write_volatile(iowin, 33); 
     core::ptr::write_volatile(ioregsel, 0x13);
+    core::ptr::write_volatile(iowin, 0); 
+
+    // NEW: Route PS/2 Mouse (IRQ 12 -> Vector 44)
+    // Register = 0x10 + (12 * 2) = 0x28
+    core::ptr::write_volatile(ioregsel, 0x28);
+    core::ptr::write_volatile(iowin, 44); 
+    core::ptr::write_volatile(ioregsel, 0x29);
     core::ptr::write_volatile(iowin, 0); 
 }
 
@@ -91,4 +105,17 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
         unsafe { crate::compositor::terminal_print(c, 0x10B981); }
     }
     notify_end_of_interrupt(KEYBOARD_INT);
+}
+
+// ---------------------------------------------------------
+// NEW: THE MOUSE HARDWARE HANDLER
+// ---------------------------------------------------------
+extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    let mut port = Port::<u8>::new(0x60);
+    let packet = unsafe { port.read() };
+    
+    // Inject the raw electricity straight into our Lock-Free Engine!
+    crate::mouse::process_packet_byte(packet);
+    
+    notify_end_of_interrupt(MOUSE_INT);
 }

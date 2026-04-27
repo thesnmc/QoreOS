@@ -14,6 +14,8 @@ pub mod e1000;
 pub mod memory;
 pub mod frame_allocator;
 pub mod compositor; 
+pub mod nvme; 
+pub mod mouse;
 
 #[repr(C)]
 pub struct BootInfo {
@@ -30,6 +32,7 @@ pub struct UefiMemoryDescriptor {
 }
 
 pub static mut NET_CARD: Option<e1000::E1000> = None;
+pub static mut NVME_DRIVE: Option<nvme::Nvme> = None; 
 
 #[unsafe(no_mangle)]
 pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
@@ -49,10 +52,11 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     let mut local_apic_base: u64 = 0;
     let mut ioapic_base: u64 = 0;
     let mut nvme_found = false;
+    let mut nvme_bar0: u64 = 0; 
     let mut xhci_found = false;
-    let mut xhci_bar0: u64 = 0; // NEW: Storing the physical memory address of the USB Silicon
+    let mut _xhci_bar0: u64 = 0; 
 
-    if let Ok(sig_str) = core::str::from_utf8(&signature) {
+    if let Ok(_sig_str) = core::str::from_utf8(&signature) { 
         let xsdt_ptr_location = (rsdp_ptr as usize + 24) as *const u64;
         let xsdt_address = unsafe { core::ptr::read_unaligned(xsdt_ptr_location) };
         let xsdt_length = unsafe { core::ptr::read_unaligned((xsdt_address as usize + 4) as *const u32) };
@@ -75,13 +79,12 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         if mcfg_address != 0 { 
             e1000_bar0 = pcie::scan_bus_zero(mcfg_address); 
             
-            // ---------------------------------------------------------
-            // TARGET 2: HIGH-RESOLUTION PCIe ECAM DISCOVERY
-            // ---------------------------------------------------------
+            let pcie_base_addr = unsafe { core::ptr::read_unaligned((mcfg_address as usize + 44) as *const u64) };
+
             for bus in 0..=255 {
                 for device in 0..32 {
                     for function in 0..8 {
-                        let pci_addr = mcfg_address + (bus << 20) + (device << 15) + (function << 12);
+                        let pci_addr = pcie_base_addr + (bus << 20) + (device << 15) + (function << 12);
                         let vendor_id = unsafe { core::ptr::read_volatile(pci_addr as *const u16) };
                         
                         if vendor_id != 0xFFFF { 
@@ -89,21 +92,37 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                             let subclass = unsafe { core::ptr::read_volatile((pci_addr + 0x0A) as *const u8) };
                             let prog_if = unsafe { core::ptr::read_volatile((pci_addr + 0x09) as *const u8) };
                             
-                            // Identify NVMe Storage
-                            if class_code == 0x01 && subclass == 0x08 { nvme_found = true; }
+                            // ---------------------------------------------------------
+                            // THE FIX: DYNAMIC 32/64 BIT BAR PARSING
+                            // ---------------------------------------------------------
+                            if class_code == 0x01 && subclass == 0x08 { 
+                                nvme_found = true; 
+                                let bar0_raw = unsafe { core::ptr::read_volatile((pci_addr + 0x10) as *const u32) };
+                                let bar_type = (bar0_raw >> 1) & 0x03;
+                                
+                                if bar_type == 2 { // 64-bit BAR
+                                    let bar1_raw = unsafe { core::ptr::read_volatile((pci_addr + 0x14) as *const u32) };
+                                    nvme_bar0 = ((bar1_raw as u64) << 32) | ((bar0_raw & 0xFFFFFFF0) as u64);
+                                } else { // 32-bit BAR
+                                    nvme_bar0 = (bar0_raw & 0xFFFFFFF0) as u64;
+                                }
+
+                                let cmd_addr = (pci_addr + 0x04) as *mut u16;
+                                let mut cmd = unsafe { core::ptr::read_volatile(cmd_addr) };
+                                cmd |= (1 << 1) | (1 << 2); 
+                                unsafe { core::ptr::write_volatile(cmd_addr, cmd); }
+                            }
                             
-                            // Identify modern xHCI USB 3.0 Controller
                             if class_code == 0x0C && subclass == 0x03 && prog_if == 0x30 { 
                                 xhci_found = true; 
-                                // Extract BAR0 (Offset 0x10). Mask out the lower 4 bits (flags).
                                 let bar0_raw = unsafe { core::ptr::read_volatile((pci_addr + 0x10) as *const u32) };
-                                xhci_bar0 = (bar0_raw & 0xFFFFFFF0) as u64;
+                                _xhci_bar0 = (bar0_raw & 0xFFFFFFF0) as u64; 
                             }
                         }
                     }
                 }
             }
-        } // <-- THIS BRACE WAS MISSING! IT IS FIXED NOW.
+        }
         
         if madt_address != 0 {
             local_apic_base = unsafe { core::ptr::read_unaligned((madt_address as usize + 0x24) as *const u32) } as u64;
@@ -139,9 +158,6 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         let mut ps2_cmd = x86_64::instructions::port::Port::<u8>::new(0x64);
         ps2_cmd.write(0xAE); 
 
-        // ---------------------------------------------------------
-        // TARGET 1: SMP AWAKENING (INIT-SIPI)
-        // ---------------------------------------------------------
         if local_apic_base != 0 {
             let icr_low = (local_apic_base + 0x300) as *mut u32;
             core::ptr::write_volatile(icr_low, 0x000C4500);
@@ -149,27 +165,91 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
             core::ptr::write_volatile(icr_low, 0x000C4608);
         }
 
+        mouse::init();
         x86_64::instructions::interrupts::enable();
 
-        // ---------------------------------------------------------
-        // TARGET 3: DYNAMIC UI CONSOLE
-        // ---------------------------------------------------------
         compositor::init(boot_info);
         compositor::fill_rect(0, 0, compositor::SERVER.width, compositor::SERVER.height, 0xFFFFFF);
         compositor::fill_rect(0, 0, compositor::SERVER.width, 40, 0x1E293B);
-        compositor::draw_string(20, 10, "EDGECORE UNIKERNEL SECURE CONSOLE", 0xFFFFFF, 2);
+        compositor::draw_string(20, 10, "QOREOS UNIKERNEL SECURE CONSOLE", 0xFFFFFF, 2);
 
         compositor::terminal_print("INIT: Core 0 (BSP) Online.\n", 0x10B981);
         compositor::terminal_print("INIT: APIC Interrupt Routing Established.\n", 0x10B981);
         
-        if nvme_found { compositor::terminal_print("ECAM: NVMe Direct Storage Controller Found!\n", 0x3B82F6); }
+        if nvme_found && nvme_bar0 != 0 { 
+            compositor::terminal_print("ECAM: NVMe Direct Storage Controller Found!\n", 0x3B82F6); 
+            let mut drive = nvme::Nvme::new(nvme_bar0);
+            drive.init();
+            drive.identify_controller();
+            NVME_DRIVE = Some(drive);
+        }
+
         if xhci_found { compositor::terminal_print("ECAM: xHCI Extensible Host Controller Found!\n", 0x3B82F6); }
         
         compositor::terminal_print("SMP: INIT-SIPI IPI Broadcast Transmitted to AP Cores.\n", 0x3B82F6);
         compositor::terminal_print("\n> TYPE A MESSAGE AND HIT ENTER TO FIRE UDP\n> ", 0x1E293B);
     }
 
-    loop { x86_64::instructions::hlt(); }
+    unsafe {
+        if let Some(ref mut nic) = NET_CARD {
+            nic.arp_request([10, 0, 2, 2]); 
+        }
+    }
+
+    // ---------------------------------------------------------
+    // THE QOREOS MAIN IDLE LOOP
+    // ---------------------------------------------------------
+    // ---------------------------------------------------------
+    // THE QOREOS MAIN IDLE LOOP
+    // ---------------------------------------------------------
+    let mut old_mx = -1;
+    let mut old_my = -1;
+
+    loop { 
+        unsafe {
+            // 1. Process Network Traffic
+            if let Some(ref mut nic) = NET_CARD { nic.poll(); }
+
+            // 2. Fetch the lock-free Mouse Coordinates
+            let mut mx = mouse::MOUSE_X.load(core::sync::atomic::Ordering::Relaxed);
+            let mut my = mouse::MOUSE_Y.load(core::sync::atomic::Ordering::Relaxed);
+
+            // If the mouse moved, we need to redraw the screen!
+            if mx != old_mx || my != old_my {
+                
+                // --- HARDWARE BOUNDARY COLLISION ---
+                // Prevent the mouse from flying off the screen and crashing the GPU!
+                if mx < 0 { mx = 0; mouse::MOUSE_X.store(0, core::sync::atomic::Ordering::Relaxed); }
+                if my < 0 { my = 0; mouse::MOUSE_Y.store(0, core::sync::atomic::Ordering::Relaxed); }
+                if mx >= compositor::SERVER.width as i32 { 
+                    mx = compositor::SERVER.width as i32 - 10; 
+                    mouse::MOUSE_X.store(mx, core::sync::atomic::Ordering::Relaxed); 
+                }
+                if my >= compositor::SERVER.height as i32 { 
+                    my = compositor::SERVER.height as i32 - 10; 
+                    mouse::MOUSE_Y.store(my, core::sync::atomic::Ordering::Relaxed); 
+                }
+
+                // --- RESTORE THE BACKGROUND ---
+                // Wipe the old cursor by rapidly redrawing the clean UI underneath it
+                compositor::fill_rect(0, 0, compositor::SERVER.width, 40, 0x1E293B); // Draw Top Bar
+                compositor::draw_string(20, 10, "QOREOS UNIKERNEL SECURE CONSOLE", 0xFFFFFF, 2);
+                if let Some(ref canvas) = compositor::SERVER.terminal_layer {
+                    compositor::blit_canvas(canvas); // Blast the RAM Canvas to the screen
+                }
+
+                // --- DRAW THE FLOATING CURSOR ---
+                // Draw a sleek Blue cursor with a Black shadow
+                compositor::fill_rect(mx as usize, my as usize, 8, 8, 0x000000); 
+                compositor::fill_rect(mx as usize + 1, my as usize + 1, 6, 6, 0x3B82F6); 
+
+                old_mx = mx;
+                old_my = my;
+            }
+        }
+        // Sleep the CPU until the next hardware interrupt wakes it up
+        x86_64::instructions::hlt(); 
+    }
 }
 
 #[panic_handler]

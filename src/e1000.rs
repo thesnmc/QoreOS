@@ -1,7 +1,57 @@
-use crate::println;
-use core::ptr::{read_volatile, write_volatile};
+use core::ptr::write_volatile;
 use alloc::vec::Vec;
 use alloc::vec;
+
+// ---------------------------------------------------------
+// NEW: THE ARP CACHE SUBSYSTEM
+// ---------------------------------------------------------
+#[derive(Copy, Clone)]
+pub struct ArpEntry {
+    pub ip: [u8; 4],
+    pub mac: [u8; 6],
+    pub active: bool,
+}
+
+pub struct ArpCache {
+    entries: [ArpEntry; 16],
+}
+
+impl ArpCache {
+    pub const fn new() -> Self {
+        ArpCache {
+            entries: [ArpEntry { ip: [0; 4], mac: [0; 6], active: false }; 16],
+        }
+    }
+
+    pub fn insert(&mut self, ip: [u8; 4], mac: [u8; 6]) {
+        for entry in self.entries.iter_mut() {
+            if entry.active && entry.ip == ip {
+                entry.mac = mac;
+                return;
+            }
+        }
+        for entry in self.entries.iter_mut() {
+            if !entry.active {
+                entry.ip = ip;
+                entry.mac = mac;
+                entry.active = true;
+                return;
+            }
+        }
+    }
+
+    pub fn lookup(&self, ip: &[u8; 4]) -> Option<[u8; 6]> {
+        for entry in self.entries.iter() {
+            if entry.active && entry.ip == *ip {
+                return Some(entry.mac);
+            }
+        }
+        None
+    }
+}
+
+pub static mut ARP_TABLE: ArpCache = ArpCache::new();
+
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -32,12 +82,14 @@ pub struct E1000 {
     current_rx_bucket: usize,
     tx_ring_ptr: u64,
     current_tx_bucket: usize,
+    pub mac_address: [u8; 6],
 }
 
 impl E1000 {
     pub fn new(bar0: u64) -> Self {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]; 
         E1000 { 
-            bar0_address: bar0, rx_ring_ptr: 0, current_rx_bucket: 0, tx_ring_ptr: 0, current_tx_bucket: 0,
+            bar0_address: bar0, rx_ring_ptr: 0, current_rx_bucket: 0, tx_ring_ptr: 0, current_tx_bucket: 0, mac_address: mac,
         }
     }
 
@@ -65,7 +117,6 @@ impl E1000 {
             self.write_register(0x2818, (num_descriptors - 1) as u32); 
             self.write_register(0x0100, (1 << 1) | (1 << 15));
         }
-        println!(">>> RECEIVE DMA ACTIVE <<<");
     }
 
     pub fn init_tx_ring(&mut self) {
@@ -85,99 +136,6 @@ impl E1000 {
             self.write_register(0x3818, 0); 
             self.write_register(0x0400, (1 << 1) | (1 << 3));
         }
-        println!(">>> TRANSMIT DMA ACTIVE <<<");
-    }
-
-    pub fn shout(&mut self) {
-        let mut frame: Vec<u8> = vec![
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 
-            0x52, 0x54, 0x00, 0x12, 0x34, 0x56, 
-            0x08, 0x06,                         
-            0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01, 
-            0x52, 0x54, 0x00, 0x12, 0x34, 0x56, 
-            10, 0, 2, 15,                       
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-            10, 0, 2, 2,                        
-        ];
-        frame.resize(60, 0);
-        let frame_ptr = alloc::boxed::Box::leak(frame.into_boxed_slice()).as_ptr() as u64;
-        let descriptor_addr = self.tx_ring_ptr + (self.current_tx_bucket as u64 * 16);
-        let descriptor_ptr = descriptor_addr as *mut TxDescriptor;
-        unsafe {
-            (*descriptor_ptr).buffer_address = frame_ptr;
-            (*descriptor_ptr).length = 60;
-            (*descriptor_ptr).cmd = (1 << 0) | (1 << 1) | (1 << 3);
-        }
-        self.current_tx_bucket = (self.current_tx_bucket + 1) % 8;
-        unsafe { self.write_register(0x3818, self.current_tx_bucket as u32); }
-        println!(">>> SHOUTING INTO THE VOID (Broadcast ARP Transmitted!) <<<");
-    }
-
-    pub fn ping(&mut self, target_mac: [u8; 6]) {
-        let mut frame: Vec<u8> = vec![
-            target_mac[0], target_mac[1], target_mac[2], target_mac[3], target_mac[4], target_mac[5],
-            0x52, 0x54, 0x00, 0x12, 0x34, 0x56, 
-            0x08, 0x00, 
-            0x45, 0x00, 0x00, 0x3C, 
-            0x12, 0x34, 0x40, 0x00, 
-            0x40, 0x01, 0x10, 0x7D, 
-            10, 0, 2, 15,           
-            10, 0, 2, 2,            
-            0x08, 0x00, 0x95, 0x5D, 
-            0x00, 0x01, 0x00, 0x01, 
-            0x45, 0x64, 0x67, 0x65, 0x43, 0x6F, 0x72, 0x65, 
-            0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
-        ];
-
-        let frame_ptr = alloc::boxed::Box::leak(frame.into_boxed_slice()).as_ptr() as u64;
-        let descriptor_addr = self.tx_ring_ptr + (self.current_tx_bucket as u64 * 16);
-        let descriptor_ptr = descriptor_addr as *mut TxDescriptor;
-        unsafe {
-            (*descriptor_ptr).buffer_address = frame_ptr;
-            (*descriptor_ptr).length = 74;
-            (*descriptor_ptr).cmd = (1 << 0) | (1 << 1) | (1 << 3);
-        }
-        self.current_tx_bucket = (self.current_tx_bucket + 1) % 8;
-        unsafe { self.write_register(0x3818, self.current_tx_bucket as u32); }
-    }
-
-    // ---------------------------------------------------------
-    // NEW: The Stateless UDP Cannon
-    // ---------------------------------------------------------
-    pub fn udp_broadcast(&mut self) {
-        let mut frame: Vec<u8> = vec![
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Dst MAC (Broadcast)
-            0x52, 0x54, 0x00, 0x12, 0x34, 0x56, // Src MAC
-            0x08, 0x00,                         // EtherType: IPv4
-
-            0x45, 0x00, 0x00, 0x3A, // IPv4 Length: 58 bytes
-            0x00, 0x00, 0x40, 0x00, // ID, Flags
-            0x40, 0x11, 0x00, 0x00, // TTL, Protocol (17 = UDP)
-            10, 0, 2, 15,           // Src IP
-            255, 255, 255, 255,     // Dst IP
-
-            0x1A, 0x0A, // Src Port 6666
-            0x1A, 0x0B, // Dst Port 6667
-            0x00, 0x26, // UDP Length: 38 bytes
-            0x00, 0x00, // Checksum
-
-            // Payload: "EDGECORE SOVEREIGN NODE ONLINE"
-            b'E',b'D',b'G',b'E',b'C',b'O',b'R',b'E',b' ',
-            b'S',b'O',b'V',b'E',b'R',b'E',b'I',b'G',b'N',b' ',
-            b'N',b'O',b'D',b'E',b' ',
-            b'O',b'N',b'L',b'I',b'N',b'E'
-        ];
-
-        let frame_ptr = alloc::boxed::Box::leak(frame.into_boxed_slice()).as_ptr() as u64;
-        let descriptor_addr = self.tx_ring_ptr + (self.current_tx_bucket as u64 * 16);
-        let descriptor_ptr = descriptor_addr as *mut TxDescriptor;
-        unsafe {
-            (*descriptor_ptr).buffer_address = frame_ptr;
-            (*descriptor_ptr).length = 72;
-            (*descriptor_ptr).cmd = (1 << 0) | (1 << 1) | (1 << 3);
-        }
-        self.current_tx_bucket = (self.current_tx_bucket + 1) % 8;
-        unsafe { self.write_register(0x3818, self.current_tx_bucket as u32); }
     }
 
     pub fn poll(&mut self) -> bool {
@@ -194,17 +152,108 @@ impl E1000 {
             
             match ethertype {
                 0x0806 => {
-                    let mut target_mac = [0u8; 6];
-                    target_mac.copy_from_slice(&packet_slice[6..12]); 
-                    self.current_rx_bucket = (self.current_rx_bucket + 1) % 32;
-                    self.ping(target_mac);
-                    return true;
+                    let hardware_type = ((packet_slice[14] as u16) << 8) | (packet_slice[15] as u16);
+                    let protocol_type = ((packet_slice[16] as u16) << 8) | (packet_slice[17] as u16);
+
+                    if hardware_type == 1 && protocol_type == 0x0800 {
+                        let mut sender_mac = [0u8; 6];
+                        sender_mac.copy_from_slice(&packet_slice[22..28]);
+                        
+                        let mut sender_ip = [0u8; 4];
+                        sender_ip.copy_from_slice(&packet_slice[28..32]);
+
+                        unsafe { 
+                            ARP_TABLE.insert(sender_ip, sender_mac); 
+                            crate::compositor::terminal_print("\nNET: Cached ARP Map -> IP.RESOLVED.TO.MAC\n", 0x10B981);
+                        }
+                    }
                 },
+                0x0800 => {
+                    unsafe { crate::compositor::terminal_print("\nNET: Received IPv4 Frame.\n", 0x3B82F6); }
+                }
                 _ => {}
             }
+            
             self.current_rx_bucket = (self.current_rx_bucket + 1) % 32;
+            unsafe { self.write_register(0x2818, self.current_rx_bucket as u32); }
+            
             return true; 
         }
         false 
+    }
+
+    pub fn udp_broadcast(&mut self) {
+        let frame: Vec<u8> = vec![ 
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 
+            0x52, 0x54, 0x00, 0x12, 0x34, 0x56, 
+            0x08, 0x00,                         
+            0x45, 0x00, 0x00, 0x3A, 
+            0x00, 0x00, 0x40, 0x00, 
+            0x40, 0x11, 0x00, 0x00, 
+            10, 0, 2, 15,           
+            255, 255, 255, 255,     
+            0x1A, 0x0A, 
+            0x1A, 0x0B, 
+            0x00, 0x26, 
+            0x00, 0x00, 
+            b'Q',b'O',b'R',b'E',b'O',b'S',b' ',
+            b'N',b'O',b'D',b'E',b' ',
+            b'O',b'N',b'L',b'I',b'N',b'E'
+        ];
+
+        let frame_ptr = alloc::boxed::Box::leak(frame.into_boxed_slice()).as_ptr() as u64;
+        let descriptor_addr = self.tx_ring_ptr + (self.current_tx_bucket as u64 * 16);
+        let descriptor_ptr = descriptor_addr as *mut TxDescriptor;
+        unsafe {
+            (*descriptor_ptr).buffer_address = frame_ptr;
+            (*descriptor_ptr).length = 60;
+            (*descriptor_ptr).cmd = (1 << 0) | (1 << 1) | (1 << 3);
+        }
+        self.current_tx_bucket = (self.current_tx_bucket + 1) % 8;
+        unsafe { self.write_register(0x3818, self.current_tx_bucket as u32); }
+    }
+
+    // ---------------------------------------------------------
+    // NEW: The ARP Request Engine
+    // ---------------------------------------------------------
+    pub fn arp_request(&mut self, target_ip: [u8; 4]) {
+        let mut frame: Vec<u8> = vec![
+            // 1. Ethernet Header
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Broadcast to everyone
+            self.mac_address[0], self.mac_address[1], self.mac_address[2], 
+            self.mac_address[3], self.mac_address[4], self.mac_address[5], 
+            0x08, 0x06, // EtherType: ARP (0x0806)
+
+            // 2. ARP Header
+            0x00, 0x01, // Hardware Type: Ethernet
+            0x08, 0x00, // Protocol Type: IPv4
+            0x06,       // Hardware Size (6 bytes for MAC)
+            0x04,       // Protocol Size (4 bytes for IP)
+            0x00, 0x01, // Opcode: Request (1)
+            
+            // 3. Sender Info
+            self.mac_address[0], self.mac_address[1], self.mac_address[2], 
+            self.mac_address[3], self.mac_address[4], self.mac_address[5], 
+            10, 0, 2, 15, // QoreOS Default IP
+            
+            // 4. Target Info (We don't know the MAC yet, so send zeroes)
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            target_ip[0], target_ip[1], target_ip[2], target_ip[3],
+        ];
+
+        frame.resize(60, 0); // Pad to minimum Ethernet frame size
+
+        let frame_ptr = alloc::boxed::Box::leak(frame.into_boxed_slice()).as_ptr() as u64;
+        let descriptor_addr = self.tx_ring_ptr + (self.current_tx_bucket as u64 * 16);
+        let descriptor_ptr = descriptor_addr as *mut TxDescriptor;
+        unsafe {
+            (*descriptor_ptr).buffer_address = frame_ptr;
+            (*descriptor_ptr).length = 60;
+            (*descriptor_ptr).cmd = (1 << 0) | (1 << 1) | (1 << 3);
+        }
+        self.current_tx_bucket = (self.current_tx_bucket + 1) % 8;
+        unsafe { self.write_register(0x3818, self.current_tx_bucket as u32); }
+        
+        unsafe { crate::compositor::terminal_print("\nNET: ARP Request Broadcasted to Network.\n", 0x3B82F6); }
     }
 }

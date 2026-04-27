@@ -5,8 +5,8 @@ use crate::println;
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-// Carve out exactly 2 Megabytes of RAM for our kernel's brain
-const HEAP_SIZE: usize = 2 * 1024 * 1024;
+// UPGRADED: 32 Megabytes of RAM for the double-buffered graphics and NVMe data!
+pub const HEAP_SIZE: usize = 32 * 1024 * 1024;
 
 // By declaring this as static, it gets permanently baked into the kernel's memory footprint
 static mut HEAP_MEMORY: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
