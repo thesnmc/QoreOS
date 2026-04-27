@@ -132,4 +132,42 @@ impl Nvme {
 
         unsafe { self.write_reg(0x1004, 1); }
     }
+
+    // --- THE MISSING DMA FUNCTION ---
+    pub fn read_sector_zero(&mut self) -> [u8; 512] {
+        let io_sq_ptr = unsafe { alloc_zeroed(Layout::from_size_align(128, 4096).unwrap()) } as u64;
+        let io_cq_ptr = unsafe { alloc_zeroed(Layout::from_size_align(32, 4096).unwrap()) } as u64;
+        let data_ptr = unsafe { alloc_zeroed(Layout::from_size_align(4096, 4096).unwrap()) } as u64;
+
+        let asq = unsafe { core::slice::from_raw_parts_mut(self.asq_ptr as *mut NvmeCmd, 16) };
+        let acq = unsafe { core::slice::from_raw_parts_mut(self.acq_ptr as *mut NvmeCompletion, 16) };
+
+        // 1. Create I/O Completion Queue (CQID = 1)
+        asq[1] = NvmeCmd { cdw0: 0x05 | (1 << 16), nsid: 0, reserved: 0, mptr: 0, prp1: io_cq_ptr, prp2: 0, cdw10: (1 << 16) | 1, cdw11: 1, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0 };
+        unsafe { self.write_reg(0x1000, 2); } 
+        let mut timeout = 0; while (acq[1].status & 0x01) == 0 { timeout += 1; if timeout > 10_000_000 { break; } }
+        unsafe { self.write_reg(0x1004, 2); } 
+
+        // 2. Create I/O Submission Queue (SQID = 1, CQID = 1)
+        asq[2] = NvmeCmd { cdw0: 0x01 | (2 << 16), nsid: 0, reserved: 0, mptr: 0, prp1: io_sq_ptr, prp2: 0, cdw10: (1 << 16) | 1, cdw11: (1 << 16) | 1, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0 };
+        unsafe { self.write_reg(0x1000, 3); } 
+        timeout = 0; while (acq[2].status & 0x01) == 0 { timeout += 1; if timeout > 10_000_000 { break; } }
+        unsafe { self.write_reg(0x1004, 3); }
+
+        // 3. Submit READ Command to I/O SQ (Opcode 0x02, NSID=1, LBA=0)
+        let iosq = unsafe { core::slice::from_raw_parts_mut(io_sq_ptr as *mut NvmeCmd, 2) };
+        let iocq = unsafe { core::slice::from_raw_parts_mut(io_cq_ptr as *mut NvmeCompletion, 2) };
+        
+        iosq[0] = NvmeCmd { cdw0: 0x02, nsid: 1, reserved: 0, mptr: 0, prp1: data_ptr, prp2: 0, cdw10: 0, cdw11: 0, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0 };
+        unsafe { self.write_reg(0x1008, 1); } // IOSQ Doorbell Tail
+        
+        timeout = 0; while (iocq[0].status & 0x01) == 0 { timeout += 1; if timeout > 10_000_000 { break; } }
+        unsafe { self.write_reg(0x100C, 1); } // IOCQ Doorbell Head
+
+        // 4. Return Sector Data
+        let mut sector = [0u8; 512];
+        let raw_data = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, 512) };
+        sector.copy_from_slice(raw_data);
+        sector
+    }
 }

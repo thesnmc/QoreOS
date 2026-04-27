@@ -56,6 +56,9 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     let mut xhci_found = false;
     let mut _xhci_bar0: u64 = 0; 
 
+    // --- DECLARED AT THE ROOT SO THE GUI CAN READ IT ---
+    let mut sector_data_str = alloc::string::String::new();
+
     if let Ok(_sig_str) = core::str::from_utf8(&signature) { 
         let xsdt_ptr_location = (rsdp_ptr as usize + 24) as *const u64;
         let xsdt_address = unsafe { core::ptr::read_unaligned(xsdt_ptr_location) };
@@ -92,9 +95,6 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                             let subclass = unsafe { core::ptr::read_volatile((pci_addr + 0x0A) as *const u8) };
                             let prog_if = unsafe { core::ptr::read_volatile((pci_addr + 0x09) as *const u8) };
                             
-                            // ---------------------------------------------------------
-                            // THE FIX: DYNAMIC 32/64 BIT BAR PARSING
-                            // ---------------------------------------------------------
                             if class_code == 0x01 && subclass == 0x08 { 
                                 nvme_found = true; 
                                 let bar0_raw = unsafe { core::ptr::read_volatile((pci_addr + 0x10) as *const u32) };
@@ -181,6 +181,20 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
             let mut drive = nvme::Nvme::new(nvme_bar0);
             drive.init();
             drive.identify_controller();
+            
+            // --- EXECUTE DMA READ ON SECTOR 0 ---
+            let sector = drive.read_sector_zero();
+            let mut string_len = 0;
+            while string_len < 512 && sector[string_len] != 0 { string_len += 1; }
+            
+            if let Ok(secret_str) = core::str::from_utf8(&sector[..string_len]) {
+                compositor::terminal_print("\n> DMA READ SUCCESS! SECTOR 0: ", 0x10B981);
+                compositor::terminal_print(secret_str, 0xF59E0B); 
+                compositor::terminal_print("\n\n", 0xFFFFFF);
+                
+                sector_data_str = alloc::string::String::from(secret_str);
+            }
+
             NVME_DRIVE = Some(drive);
         }
 
@@ -197,57 +211,101 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     }
 
     // ---------------------------------------------------------
-    // THE QOREOS MAIN IDLE LOOP
-    // ---------------------------------------------------------
-    // ---------------------------------------------------------
-    // THE QOREOS MAIN IDLE LOOP
+    // THE QOREOS MAIN IDLE LOOP (WITH LIVE TELEMETRY)
     // ---------------------------------------------------------
     let mut old_mx = -1;
     let mut old_my = -1;
+    let mut old_mbtn = 0;
+
+    let mut desktop_win = compositor::Window::new(100, 200, 600, 250, "EDGECORE DIAGNOSTICS", 0x334155);
+    
+    let mut is_dragging = false;
+    let mut drag_offset_x = 0;
+    let mut drag_offset_y = 0;
 
     loop { 
         unsafe {
-            // 1. Process Network Traffic
             if let Some(ref mut nic) = NET_CARD { nic.poll(); }
 
-            // 2. Fetch the lock-free Mouse Coordinates
             let mut mx = mouse::MOUSE_X.load(core::sync::atomic::Ordering::Relaxed);
             let mut my = mouse::MOUSE_Y.load(core::sync::atomic::Ordering::Relaxed);
+            let mbtn = mouse::MOUSE_BTN.load(core::sync::atomic::Ordering::Relaxed);
+            
+            let left_click = (mbtn & 0x01) != 0; 
+            let click_just_pressed = left_click && (old_mbtn & 0x01) == 0; 
 
-            // If the mouse moved, we need to redraw the screen!
-            if mx != old_mx || my != old_my {
+            if mx != old_mx || my != old_my || mbtn != old_mbtn {
                 
-                // --- HARDWARE BOUNDARY COLLISION ---
-                // Prevent the mouse from flying off the screen and crashing the GPU!
                 if mx < 0 { mx = 0; mouse::MOUSE_X.store(0, core::sync::atomic::Ordering::Relaxed); }
                 if my < 0 { my = 0; mouse::MOUSE_Y.store(0, core::sync::atomic::Ordering::Relaxed); }
-                if mx >= compositor::SERVER.width as i32 { 
-                    mx = compositor::SERVER.width as i32 - 10; 
-                    mouse::MOUSE_X.store(mx, core::sync::atomic::Ordering::Relaxed); 
-                }
-                if my >= compositor::SERVER.height as i32 { 
-                    my = compositor::SERVER.height as i32 - 10; 
-                    mouse::MOUSE_Y.store(my, core::sync::atomic::Ordering::Relaxed); 
+                if mx >= compositor::SERVER.width as i32 { mx = compositor::SERVER.width as i32 - 10; mouse::MOUSE_X.store(mx, core::sync::atomic::Ordering::Relaxed); }
+                if my >= compositor::SERVER.height as i32 { my = compositor::SERVER.height as i32 - 10; mouse::MOUSE_Y.store(my, core::sync::atomic::Ordering::Relaxed); }
+
+                // --- WINDOW PHYSICS & BUTTONS ---
+                if desktop_win.is_open {
+                    let close_x = desktop_win.x + desktop_win.width as i32 - 20;
+                    let close_y = desktop_win.y + 4;
+
+                    if click_just_pressed && mx >= close_x && mx <= close_x + 16 && my >= close_y && my <= close_y + 16 {
+                        desktop_win.is_open = false;
+                        is_dragging = false;
+                    } 
+                    else if left_click {
+                        if !is_dragging {
+                            if mx >= desktop_win.x && mx <= desktop_win.x + desktop_win.width as i32 && 
+                               my >= desktop_win.y && my <= desktop_win.y + 24 {
+                                is_dragging = true;
+                                drag_offset_x = mx - desktop_win.x;
+                                drag_offset_y = my - desktop_win.y;
+                            }
+                        } else {
+                            desktop_win.x = mx - drag_offset_x;
+                            desktop_win.y = my - drag_offset_y;
+                            if desktop_win.x < 0 { desktop_win.x = 0; }
+                            if desktop_win.y < 40 { desktop_win.y = 40; } 
+                            if desktop_win.x + desktop_win.width as i32 > compositor::SERVER.width as i32 { desktop_win.x = compositor::SERVER.width as i32 - desktop_win.width as i32; }
+                            if desktop_win.y + desktop_win.height as i32 > compositor::SERVER.height as i32 { desktop_win.y = compositor::SERVER.height as i32 - desktop_win.height as i32; }
+                        }
+                    } else {
+                        is_dragging = false;
+                    }
                 }
 
-                // --- RESTORE THE BACKGROUND ---
-                // Wipe the old cursor by rapidly redrawing the clean UI underneath it
-                compositor::fill_rect(0, 0, compositor::SERVER.width, 40, 0x1E293B); // Draw Top Bar
+                // --- RENDERING PIPELINE ---
+                compositor::fill_rect(0, 0, compositor::SERVER.width, 40, 0x1E293B); 
                 compositor::draw_string(20, 10, "QOREOS UNIKERNEL SECURE CONSOLE", 0xFFFFFF, 2);
-                if let Some(ref canvas) = compositor::SERVER.terminal_layer {
-                    compositor::blit_canvas(canvas); // Blast the RAM Canvas to the screen
-                }
+                if let Some(ref canvas) = compositor::SERVER.terminal_layer { compositor::blit_canvas(canvas); }
 
-                // --- DRAW THE FLOATING CURSOR ---
-                // Draw a sleek Blue cursor with a Black shadow
+                if desktop_win.is_open {
+                    compositor::draw_window(&desktop_win);
+                    
+                    let text_x = desktop_win.x as usize + 20;
+                    let text_y = desktop_win.y as usize + 50;
+                    
+                    let diag_text = alloc::format!("MOUSE X: {}   MOUSE Y: {}", mx, my);
+                    compositor::draw_string(text_x, text_y, &diag_text, 0x10B981, 2); 
+                    compositor::draw_string(text_x, text_y + 40, "SYS: 2MB RING-0 SAFE ZONE ACTIVE", 0xFFFFFF, 1);
+                    compositor::draw_string(text_x, text_y + 60, "SYS: E1000 NETWORK CARD ONLINE", 0xFFFFFF, 1);
+                    
+                    let nvme_status = if nvme_found { "DATA SECURED" } else { "NOT DETECTED" };
+                    let nvme_text = alloc::format!("STORAGE: NVME CONTROLLER {}", nvme_status);
+                    compositor::draw_string(text_x, text_y + 80, &nvme_text, 0x3B82F6, 1);
+
+                    if sector_data_str.len() > 0 {
+                        compositor::draw_string(text_x, text_y + 110, "EXTRACTED HEX PAYLOAD:", 0x10B981, 1);
+                        compositor::draw_string(text_x, text_y + 130, &sector_data_str, 0xF59E0B, 1);
+                    }
+                } 
+
+                let cursor_color = if is_dragging { 0x10B981 } else { 0x3B82F6 };
                 compositor::fill_rect(mx as usize, my as usize, 8, 8, 0x000000); 
-                compositor::fill_rect(mx as usize + 1, my as usize + 1, 6, 6, 0x3B82F6); 
+                compositor::fill_rect(mx as usize + 1, my as usize + 1, 6, 6, cursor_color); 
 
                 old_mx = mx;
                 old_my = my;
+                old_mbtn = mbtn;
             }
         }
-        // Sleep the CPU until the next hardware interrupt wakes it up
         x86_64::instructions::hlt(); 
     }
 }

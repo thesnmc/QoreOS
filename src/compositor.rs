@@ -207,3 +207,47 @@ pub unsafe fn terminal_print(text: &str, color: u32) {
         blit_canvas(canvas);
     }
 }
+
+// ---------------------------------------------------------
+// ---------------------------------------------------------
+// THE 2D WINDOW MANAGER
+// ---------------------------------------------------------
+pub struct Window {
+    pub x: i32,
+    pub y: i32,
+    pub width: usize,
+    pub height: usize,
+    pub title: &'static str,
+    pub bg_color: u32,
+    pub is_open: bool, // NEW: Track if the window is alive
+}
+
+impl Window {
+    pub fn new(x: i32, y: i32, width: usize, height: usize, title: &'static str, bg_color: u32) -> Self {
+        Window { x, y, width, height, title, bg_color, is_open: true }
+    }
+}
+
+pub unsafe fn draw_window(win: &Window) {
+    if !win.is_open { return; } // Don't draw if it's closed!
+
+    let safe_x = if win.x < 0 { 0 } else { win.x as usize };
+    let safe_y = if win.y < 0 { 0 } else { win.y as usize };
+    
+    if safe_x + win.width > SERVER.width || safe_y + win.height > SERVER.height { return; }
+
+    // Drop-Shadow
+    fill_rect(safe_x + 4, safe_y + 4, win.width, win.height, 0x000000);
+    // Main Background
+    fill_rect(safe_x, safe_y, win.width, win.height, win.bg_color);
+    // Title Bar
+    fill_rect(safe_x, safe_y, win.width, 24, 0x0F172A);
+    // Title Text
+    draw_string(safe_x + 8, safe_y + 8, win.title, 0xFFFFFF, 1);
+
+    // --- NEW: THE RED CLOSE BUTTON ---
+    let close_x = safe_x + win.width - 20;
+    let close_y = safe_y + 4;
+    fill_rect(close_x, close_y, 16, 16, 0xEF4444); // Bright Red
+    draw_string(close_x + 4, close_y + 4, "X", 0xFFFFFF, 1); // White X
+}
