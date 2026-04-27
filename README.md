@@ -76,5 +76,5 @@ qemu-system-x86_64 -machine q35 -bios /usr/share/ovmf/OVMF.fd -drive format=raw,
 - [x] Phase 4: Sovereign 2D Window Manager (Lock-free mouse, drag physics)
 - [x] Phase 5: Stateless Network Stack (E1000, ARP Caching, UDP Broadcasts)
 - [x] Phase 6: NVMe Storage Engine (ASQ/ACQ DMA Rings & Sector Extraction)
-- [ ] Phase 7: Native File System implementation (FAT32/ext4)
-- [ ] Phase 8: Ring-3 User-Space Process Scheduler
+- [x] Phase 7: Native File System implementation (FAT32/ext4)
+- [x] Phase 8: Ring-3 User-Space Process Scheduler

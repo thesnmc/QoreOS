@@ -17,6 +17,7 @@ pub mod compositor;
 pub mod nvme; 
 pub mod mouse;
 pub mod fat32;
+pub mod usermode;
 
 #[repr(C)]
 pub struct BootInfo {
@@ -34,6 +35,14 @@ pub struct UefiMemoryDescriptor {
 
 pub static mut NET_CARD: Option<e1000::E1000> = None;
 pub static mut NVME_DRIVE: Option<nvme::Nvme> = None; 
+
+// --- THE RING-3 SANDBOX APP ---
+// This runs entirely in isolated User Mode. 
+extern "C" fn ring3_user_task() -> ! {
+    loop {
+        // Spinning safely in the Ring-3 Sandbox...
+    }
+}
 
 #[unsafe(no_mangle)]
 pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
@@ -57,7 +66,6 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     let mut xhci_found = false;
     let mut _xhci_bar0: u64 = 0; 
 
-    // --- DECLARED AT THE ROOT SO THE GUI CAN READ IT ---
     let mut sector_data_str = alloc::string::String::new();
 
     if let Ok(_sig_str) = core::str::from_utf8(&signature) { 
@@ -183,29 +191,24 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
             drive.init();
             drive.identify_controller();
             
-            // --- NEW: ABSTRACTION-DRIVEN FAT32 DMA EXTRACTION ---
             let sector_0 = drive.read_sector(0);
-            let bpb = unsafe { &*(sector_0.as_ptr() as *const fat32::Fat32BootSector) };
+            let bpb = &*(sector_0.as_ptr() as *const fat32::Fat32BootSector);
             
-            // 1. Initialize our clean Volume Abstraction
             let volume = fat32::Fat32Volume::new(bpb);
             
-            // 2. Read the Root Directory (Cluster 2)
             let root_lba = volume.cluster_to_lba(volume.root_cluster);
             if root_lba > 0 {
                 let root_sector = drive.read_sector(root_lba);
-                let entries = unsafe { core::slice::from_raw_parts(root_sector.as_ptr() as *const fat32::Fat32DirEntry, 512 / 32) };
+                let entries = core::slice::from_raw_parts(root_sector.as_ptr() as *const fat32::Fat32DirEntry, 512 / 32);
                 
                 let mut payload_cluster = 0;
                 for entry in entries {
-                    // Look for our specific test payload file
                     if entry.name == *b"PAYLOAD TXT" {
                         payload_cluster = ((entry.fst_clus_hi as u32) << 16) | (entry.fst_clus_lo as u32);
                         break;
                     }
                 }
                 
-                // 3. Extract the File Content
                 if payload_cluster >= 2 {
                     let payload_lba = volume.cluster_to_lba(payload_cluster);
                     let payload_sector = drive.read_sector(payload_lba);
@@ -240,10 +243,8 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     }
 
     // ---------------------------------------------------------
-    // THE QOREOS MAIN IDLE LOOP (WITH CONTINUOUS RENDER)
+    // THE QOREOS MAIN IDLE LOOP
     // ---------------------------------------------------------
-    let mut old_mx = -1;
-    let mut old_my = -1;
     let mut old_mbtn = 0;
 
     let mut desktop_win = compositor::Window::new(100, 200, 600, 250, "EDGECORE DIAGNOSTICS", 0x334155);
@@ -263,13 +264,14 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
             let left_click = (mbtn & 0x01) != 0; 
             let click_just_pressed = left_click && (old_mbtn & 0x01) == 0; 
 
-            // --- HARDWARE BOUNDARIES ---
             if mx < 0 { mx = 0; mouse::MOUSE_X.store(0, core::sync::atomic::Ordering::Relaxed); }
             if my < 0 { my = 0; mouse::MOUSE_Y.store(0, core::sync::atomic::Ordering::Relaxed); }
             if mx >= compositor::SERVER.width as i32 { mx = compositor::SERVER.width as i32 - 10; mouse::MOUSE_X.store(mx, core::sync::atomic::Ordering::Relaxed); }
             if my >= compositor::SERVER.height as i32 { my = compositor::SERVER.height as i32 - 10; mouse::MOUSE_Y.store(my, core::sync::atomic::Ordering::Relaxed); }
 
-            // --- WINDOW PHYSICS & BUTTONS ---
+            let drop_btn_x = desktop_win.x as usize + 20;
+            let drop_btn_y = desktop_win.y as usize + 170;
+
             if desktop_win.is_open {
                 let close_x = desktop_win.x + desktop_win.width as i32 - 20;
                 let close_y = desktop_win.y + 4;
@@ -278,6 +280,20 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                     desktop_win.is_open = false;
                     is_dragging = false;
                 } 
+                // --- THE RING-3 IGNITION TRIGGER ---
+                else if click_just_pressed && mx >= drop_btn_x as i32 && mx <= (drop_btn_x + 380) as i32 && my >= drop_btn_y as i32 && my <= (drop_btn_y + 24) as i32 {
+                    compositor::terminal_print("\n> [WARNING] EJECTING FROM KERNEL MODE. DROPPING TO RING-3...\n", 0xEF4444);
+                    if let Some(ref canvas) = compositor::SERVER.terminal_layer { compositor::blit_canvas(canvas); }
+                    
+                    static mut USER_STACK: [u8; 4096 * 4] = [0; 4096 * 4];
+                    let stack_ptr = USER_STACK.as_ptr() as u64 + (4096 * 4);
+                    
+                    let code_selector = gdt::GDT.1.user_code.0;
+                    let data_selector = gdt::GDT.1.user_data.0;
+
+                    // Execute the drop!
+                    usermode::drop_to_usermode(code_selector, data_selector, ring3_user_task as u64, stack_ptr);
+                }
                 else if left_click {
                     if !is_dragging {
                         if mx >= desktop_win.x && mx <= desktop_win.x + desktop_win.width as i32 && 
@@ -323,14 +339,16 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                     compositor::draw_string(text_x, text_y + 110, "EXTRACTED HEX PAYLOAD:", 0x10B981, 1);
                     compositor::draw_string(text_x, text_y + 130, &sector_data_str, 0xF59E0B, 1);
                 }
+
+                // DRAW THE RED BUTTON
+                compositor::fill_rect(drop_btn_x, drop_btn_y, 380, 24, 0xEF4444); 
+                compositor::draw_string(drop_btn_x + 10, drop_btn_y + 6, "INITIATE SECURE RING-3 DROP (LOCKS GUI)", 0xFFFFFF, 1);
             } 
 
             let cursor_color = if is_dragging { 0x10B981 } else { 0x3B82F6 };
             compositor::fill_rect(mx as usize, my as usize, 8, 8, 0x000000); 
             compositor::fill_rect(mx as usize + 1, my as usize + 1, 6, 6, cursor_color); 
 
-            old_mx = mx;
-            old_my = my;
             old_mbtn = mbtn;
         }
         x86_64::instructions::hlt(); 
