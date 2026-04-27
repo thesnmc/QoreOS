@@ -16,15 +16,20 @@ pub struct NvmeCompletion {
     pub cid: u16, pub status: u16,
 }
 
+// --- UPGRADE: Added permanent I/O Queue Pointers and State Trackers ---
 pub struct Nvme {
     bar0: u64,
     pub asq_ptr: u64,
     pub acq_ptr: u64,
+    pub iosq_ptr: u64,
+    pub iocq_ptr: u64,
+    pub iosq_tail: u32,
+    pub iocq_head: u32,
 }
 
 impl Nvme {
     pub fn new(bar0: u64) -> Self {
-        Nvme { bar0, asq_ptr: 0, acq_ptr: 0 }
+        Nvme { bar0, asq_ptr: 0, acq_ptr: 0, iosq_ptr: 0, iocq_ptr: 0, iosq_tail: 0, iocq_head: 0 }
     }
 
     unsafe fn read_reg(&self, offset: u64) -> u32 { read_volatile((self.bar0 + offset) as *const u32) }
@@ -47,11 +52,11 @@ impl Nvme {
         }
 
         let num_entries = 16;
-        let asq_layout = Layout::from_size_align(num_entries * 64, 4096).unwrap();
-        self.asq_ptr = unsafe { alloc_zeroed(asq_layout) } as u64;
-
-        let acq_layout = Layout::from_size_align(num_entries * 16, 4096).unwrap();
-        self.acq_ptr = unsafe { alloc_zeroed(acq_layout) } as u64;
+        // Allocate both Admin AND I/O Queues at Boot
+        self.asq_ptr = unsafe { alloc_zeroed(Layout::from_size_align(num_entries * 64, 4096).unwrap()) } as u64;
+        self.acq_ptr = unsafe { alloc_zeroed(Layout::from_size_align(num_entries * 16, 4096).unwrap()) } as u64;
+        self.iosq_ptr = unsafe { alloc_zeroed(Layout::from_size_align(num_entries * 64, 4096).unwrap()) } as u64;
+        self.iocq_ptr = unsafe { alloc_zeroed(Layout::from_size_align(num_entries * 16, 4096).unwrap()) } as u64;
 
         let aqa = ((num_entries as u32 - 1) << 16) | (num_entries as u32 - 1);
         unsafe { self.write_reg(0x24, aqa); }
@@ -71,6 +76,20 @@ impl Nvme {
             if timeout > 10_000_000 { return; }
         }
 
+        // --- UPGRADE: Create the I/O Queues EXACTLY ONCE here ---
+        let asq = unsafe { core::slice::from_raw_parts_mut(self.asq_ptr as *mut NvmeCmd, 16) };
+        let acq = unsafe { core::slice::from_raw_parts_mut(self.acq_ptr as *mut NvmeCompletion, 16) };
+
+        asq[0] = NvmeCmd { cdw0: 0x05 | (1 << 16), nsid: 0, reserved: 0, mptr: 0, prp1: self.iocq_ptr, prp2: 0, cdw10: (15 << 16) | 1, cdw11: 1, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0 };
+        unsafe { self.write_reg(0x1000, 1); } 
+        timeout = 0; while (acq[0].status & 0x01) == 0 { timeout += 1; if timeout > 10_000_000 { break; } }
+        unsafe { self.write_reg(0x1004, 1); } 
+
+        asq[1] = NvmeCmd { cdw0: 0x01 | (2 << 16), nsid: 0, reserved: 0, mptr: 0, prp1: self.iosq_ptr, prp2: 0, cdw10: (15 << 16) | 1, cdw11: (1 << 16) | 1, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0 };
+        unsafe { self.write_reg(0x1000, 2); } 
+        timeout = 0; while (acq[1].status & 0x01) == 0 { timeout += 1; if timeout > 10_000_000 { break; } }
+        unsafe { self.write_reg(0x1004, 2); }
+
         unsafe { crate::compositor::terminal_print("SYS: NVMe Admin Rings DMA Mapped. Drive READY!\n", 0x10B981); }
     }
 
@@ -79,16 +98,14 @@ impl Nvme {
         let data_ptr = unsafe { alloc_zeroed(buffer_layout) } as u64;
 
         let asq = unsafe { core::slice::from_raw_parts_mut(self.asq_ptr as *mut NvmeCmd, 16) };
-        asq[0] = NvmeCmd { cdw0: 0, nsid: 0, reserved: 0, mptr: 0, prp1: 0, prp2: 0, cdw10: 0, cdw11: 0, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0 };
-        asq[0].cdw0 = 0x06 | (0xAA << 16); 
-        asq[0].prp1 = data_ptr; 
-        asq[0].cdw10 = 1; 
+        // Shift to index 2 because indices 0 and 1 were used to create the I/O queues!
+        asq[2] = NvmeCmd { cdw0: 0x06 | (0xAA << 16), nsid: 0, reserved: 0, mptr: 0, prp1: data_ptr, prp2: 0, cdw10: 1, cdw11: 0, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0 };
 
-        unsafe { self.write_reg(0x1000, 1); }
+        unsafe { self.write_reg(0x1000, 3); }
 
         let acq = unsafe { core::slice::from_raw_parts_mut(self.acq_ptr as *mut NvmeCompletion, 16) };
         let mut timeout = 0;
-        while (acq[0].status & 0x01) == 0 {
+        while (acq[2].status & 0x01) == 0 {
             unsafe { core::arch::asm!("nop"); }
             timeout += 1;
             if timeout > 10_000_000 { return; }
@@ -96,7 +113,6 @@ impl Nvme {
 
         let data = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, 4096) };
         
-        // Extract Model Number (Bytes 24 to 63)
         let mut model_bytes = [0u8; 40];
         let mut actual_len = 0;
         for i in 0..40 {
@@ -107,7 +123,6 @@ impl Nvme {
             }
         }
 
-        // Extract Serial Number (Bytes 4 to 23)
         let mut serial_bytes = [0u8; 20];
         let mut serial_len = 0;
         for i in 0..20 {
@@ -121,50 +136,50 @@ impl Nvme {
         if let Ok(model_str) = core::str::from_utf8(&model_bytes[..actual_len]) {
             if let Ok(serial_str) = core::str::from_utf8(&serial_bytes[..serial_len]) {
                 unsafe { 
-                    crate::compositor::terminal_print("\n> SILICON IDENTIFIED -> ", 0x3B82F6); // Blue
-                    crate::compositor::terminal_print(model_str, 0x10B981); // GREEN INK!
+                    crate::compositor::terminal_print("\n> SILICON IDENTIFIED -> ", 0x3B82F6); 
+                    crate::compositor::terminal_print(model_str, 0x10B981); 
                     crate::compositor::terminal_print(" (SN: ", 0x3B82F6);
-                    crate::compositor::terminal_print(serial_str, 0x10B981); // GREEN INK!
+                    crate::compositor::terminal_print(serial_str, 0x10B981); 
                     crate::compositor::terminal_print(")\n", 0x3B82F6);
                 }
             }
         }
 
-        unsafe { self.write_reg(0x1004, 1); }
+        unsafe { self.write_reg(0x1004, 3); }
     }
 
-    // --- THE MISSING DMA FUNCTION ---
-    pub fn read_sector_zero(&mut self) -> [u8; 512] {
-        let io_sq_ptr = unsafe { alloc_zeroed(Layout::from_size_align(128, 4096).unwrap()) } as u64;
-        let io_cq_ptr = unsafe { alloc_zeroed(Layout::from_size_align(32, 4096).unwrap()) } as u64;
+    // --- UPGRADE: Stateful DMA Engine ---
+    pub fn read_sector(&mut self, lba: u64) -> [u8; 512] {
         let data_ptr = unsafe { alloc_zeroed(Layout::from_size_align(4096, 4096).unwrap()) } as u64;
-
-        let asq = unsafe { core::slice::from_raw_parts_mut(self.asq_ptr as *mut NvmeCmd, 16) };
-        let acq = unsafe { core::slice::from_raw_parts_mut(self.acq_ptr as *mut NvmeCompletion, 16) };
-
-        // 1. Create I/O Completion Queue (CQID = 1)
-        asq[1] = NvmeCmd { cdw0: 0x05 | (1 << 16), nsid: 0, reserved: 0, mptr: 0, prp1: io_cq_ptr, prp2: 0, cdw10: (1 << 16) | 1, cdw11: 1, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0 };
-        unsafe { self.write_reg(0x1000, 2); } 
-        let mut timeout = 0; while (acq[1].status & 0x01) == 0 { timeout += 1; if timeout > 10_000_000 { break; } }
-        unsafe { self.write_reg(0x1004, 2); } 
-
-        // 2. Create I/O Submission Queue (SQID = 1, CQID = 1)
-        asq[2] = NvmeCmd { cdw0: 0x01 | (2 << 16), nsid: 0, reserved: 0, mptr: 0, prp1: io_sq_ptr, prp2: 0, cdw10: (1 << 16) | 1, cdw11: (1 << 16) | 1, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0 };
-        unsafe { self.write_reg(0x1000, 3); } 
-        timeout = 0; while (acq[2].status & 0x01) == 0 { timeout += 1; if timeout > 10_000_000 { break; } }
-        unsafe { self.write_reg(0x1004, 3); }
-
-        // 3. Submit READ Command to I/O SQ (Opcode 0x02, NSID=1, LBA=0)
-        let iosq = unsafe { core::slice::from_raw_parts_mut(io_sq_ptr as *mut NvmeCmd, 2) };
-        let iocq = unsafe { core::slice::from_raw_parts_mut(io_cq_ptr as *mut NvmeCompletion, 2) };
+        let iosq = unsafe { core::slice::from_raw_parts_mut(self.iosq_ptr as *mut NvmeCmd, 16) };
+        let iocq = unsafe { core::slice::from_raw_parts_mut(self.iocq_ptr as *mut NvmeCompletion, 16) };
         
-        iosq[0] = NvmeCmd { cdw0: 0x02, nsid: 1, reserved: 0, mptr: 0, prp1: data_ptr, prp2: 0, cdw10: 0, cdw11: 0, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0 };
-        unsafe { self.write_reg(0x1008, 1); } // IOSQ Doorbell Tail
+        let cmd_idx = self.iosq_tail as usize;
+        iocq[cmd_idx].status = 0; // Clear previous completion status
         
-        timeout = 0; while (iocq[0].status & 0x01) == 0 { timeout += 1; if timeout > 10_000_000 { break; } }
-        unsafe { self.write_reg(0x100C, 1); } // IOCQ Doorbell Head
-
-        // 4. Return Sector Data
+        let cdw10 = (lba & 0xFFFFFFFF) as u32;
+        let cdw11 = (lba >> 32) as u32;
+        
+        let cid = cmd_idx as u32;
+        iosq[cmd_idx] = NvmeCmd { cdw0: 0x02 | (cid << 16), nsid: 1, reserved: 0, mptr: 0, prp1: data_ptr, prp2: 0, cdw10, cdw11, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0 };
+        
+        // Ring the Doorbell
+        self.iosq_tail = (self.iosq_tail + 1) % 16;
+        unsafe { self.write_reg(0x1008, self.iosq_tail); } 
+        
+        // Wait for Hardware Completion
+        let mut timeout = 0;
+        let cq_idx = self.iocq_head as usize;
+        while (iocq[cq_idx].status & 0x01) == 0 {
+            unsafe { core::arch::asm!("nop"); }
+            timeout += 1;
+            if timeout > 20_000_000 { break; }
+        }
+        
+        // Acknowledge Hardware Completion
+        self.iocq_head = (self.iocq_head + 1) % 16;
+        unsafe { self.write_reg(0x100C, self.iocq_head); } 
+        
         let mut sector = [0u8; 512];
         let raw_data = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, 512) };
         sector.copy_from_slice(raw_data);
