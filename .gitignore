@@ -4,3 +4,8 @@ target/
 OVMF*.fd
 *.img
 *.iso
+
+target/
+OVMF*.fd
+*.img
+*.iso
