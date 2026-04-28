@@ -19,6 +19,7 @@ pub mod mouse;
 pub mod fat32;
 pub mod usermode;
 pub mod hda;
+pub mod net;
 
 #[repr(C)]
 pub struct BootInfo {
@@ -39,7 +40,6 @@ pub static mut NVME_DRIVE: Option<nvme::Nvme> = None;
 pub static mut AUDIO_DRIVE: Option<hda::IntelHda> = None;
 
 // --- THE RING-3 SANDBOX APP ---
-// This runs entirely in isolated User Mode. 
 extern "C" fn ring3_user_task() -> ! {
     loop {
         // Spinning safely in the Ring-3 Sandbox...
@@ -95,8 +95,6 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         }
         
         if mcfg_address != 0 { 
-            e1000_bar0 = pcie::scan_bus_zero(mcfg_address); 
-            
             let pcie_base_addr = unsafe { core::ptr::read_unaligned((mcfg_address as usize + 44) as *const u64) };
 
             for bus in 0..=255 {
@@ -110,6 +108,18 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                             let subclass = unsafe { core::ptr::read_volatile((pci_addr + 0x0A) as *const u8) };
                             let prog_if = unsafe { core::ptr::read_volatile((pci_addr + 0x09) as *const u8) };
                             
+                            // --- UPGRADE: E1000 BUS MASTERING ENABLE ---
+                            if class_code == 0x02 && subclass == 0x00 {
+                                let bar0_raw = unsafe { core::ptr::read_volatile((pci_addr + 0x10) as *const u32) };
+                                e1000_bar0 = Some((bar0_raw & 0xFFFFFFF0) as u64);
+                                
+                                // FORCE ENABLE BUS MASTERING (Allows NIC to write packets to RAM!)
+                                let cmd_addr = (pci_addr + 0x04) as *mut u16;
+                                let mut cmd = unsafe { core::ptr::read_volatile(cmd_addr) };
+                                cmd |= (1 << 1) | (1 << 2); 
+                                unsafe { core::ptr::write_volatile(cmd_addr, cmd); }
+                            }
+
                             // --- NVMe Check ---
                             if class_code == 0x01 && subclass == 0x08 { 
                                 nvme_found = true; 
@@ -213,6 +223,11 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         compositor::terminal_print("INIT: Core 0 (BSP) Online.\n", 0x10B981);
         compositor::terminal_print("INIT: APIC Interrupt Routing Established.\n", 0x10B981);
         
+        // Confirm E1000 Bus Mastering is active!
+        if e1000_bar0.is_some() {
+            compositor::terminal_print("ECAM: E1000 Network Card Found & Bus Master Enabled!\n", 0x3B82F6);
+        }
+
         // NVME INIT
         if nvme_found && nvme_bar0 != 0 { 
             compositor::terminal_print("ECAM: NVMe Direct Storage Controller Found!\n", 0x3B82F6); 
@@ -259,24 +274,24 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
             NVME_DRIVE = Some(drive);
         }
 
-        // AUDIO INIT (Perfectly timed after GUI is active)
-        // --- INTEL HDA INITIALIZED (POST-COMPOSITOR) ---
+        // AUDIO INIT
         if hda_found && hda_bar0 != 0 {
             let mut hda = hda::IntelHda::new(hda_bar0);
             hda.init();
-            hda.play_tone(); // <--- NEW: PLAY THE TONE!
+            hda.play_tone(); 
             AUDIO_DRIVE = Some(hda);
         }
 
         if xhci_found { compositor::terminal_print("ECAM: xHCI Extensible Host Controller Found!\n", 0x3B82F6); }
         
         compositor::terminal_print("SMP: INIT-SIPI IPI Broadcast Transmitted to AP Cores.\n", 0x3B82F6);
-        compositor::terminal_print("\n> TYPE A MESSAGE AND HIT ENTER TO FIRE UDP\n> ", 0x1E293B);
+        compositor::terminal_print("\n> READY: WAITING FOR INCOMING TCP CONNECTIONS\n> ", 0x1E293B);
     }
 
+    // --- AUTOMATIC FIREWALL HANDSHAKE ---
     unsafe {
         if let Some(ref mut nic) = NET_CARD {
-            nic.arp_request([10, 0, 2, 2]); 
+            nic.arp_request([10, 0, 2, 2]); // Pings QEMU Router automatically on boot!
         }
     }
 
@@ -284,8 +299,6 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     // THE QOREOS MAIN IDLE LOOP
     // ---------------------------------------------------------
     let mut old_mbtn = 0;
-
-    // UPGRADE: Height increased to 300px to fit Audio Status telemetry
     let mut desktop_win = compositor::Window::new(100, 200, 600, 300, "EDGECORE DIAGNOSTICS", 0x334155);
     
     let mut is_dragging = false;
@@ -309,7 +322,7 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
             if my >= compositor::SERVER.height as i32 { my = compositor::SERVER.height as i32 - 10; mouse::MOUSE_Y.store(my, core::sync::atomic::Ordering::Relaxed); }
 
             let drop_btn_x = desktop_win.x as usize + 20;
-            let drop_btn_y = desktop_win.y as usize + 240; // Shifted button down
+            let drop_btn_y = desktop_win.y as usize + 240; 
 
             if desktop_win.is_open {
                 let close_x = desktop_win.x + desktop_win.width as i32 - 20;
@@ -352,7 +365,6 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                 }
             }
 
-            // --- CONTINUOUS RENDERING PIPELINE ---
             compositor::fill_rect(0, 0, compositor::SERVER.width, 40, 0x1E293B); 
             compositor::draw_string(20, 10, "QOREOS UNIKERNEL SECURE CONSOLE", 0xFFFFFF, 2);
             if let Some(ref canvas) = compositor::SERVER.terminal_layer { compositor::blit_canvas(canvas); }
@@ -372,7 +384,6 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                 let nvme_text = alloc::format!("STORAGE: NVME CONTROLLER {}", nvme_status);
                 compositor::draw_string(text_x, text_y + 80, &nvme_text, 0x3B82F6, 1);
 
-                // --- UPGRADE: LIVE HDA AUDIO STATUS GUI ---
                 let hda_status = if hda_found { "PLAYING 440HZ TONE" } else { "OFFLINE" };
                 let hda_text = alloc::format!("AUDIO: INTEL HDA {}", hda_status);
                 compositor::draw_string(text_x, text_y + 100, &hda_text, 0x3B82F6, 1);
@@ -382,7 +393,6 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                     compositor::draw_string(text_x, text_y + 150, &sector_data_str, 0xF59E0B, 1);
                 }
 
-                // DRAW THE RED BUTTON
                 compositor::fill_rect(drop_btn_x, drop_btn_y, 380, 24, 0xEF4444); 
                 compositor::draw_string(drop_btn_x + 10, drop_btn_y + 6, "INITIATE SECURE RING-3 DROP (LOCKS GUI)", 0xFFFFFF, 1);
             } 
