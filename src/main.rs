@@ -274,6 +274,9 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
             NVME_DRIVE = Some(drive);
         }
 
+        // --- LINK FAT32 TO NETWORK STACK ---
+        crate::net::HTTP_PAYLOAD = Some(sector_data_str.clone());
+
         // AUDIO INIT
         if hda_found && hda_bar0 != 0 {
             let mut hda = hda::IntelHda::new(hda_bar0);
