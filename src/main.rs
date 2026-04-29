@@ -20,6 +20,7 @@ pub mod fat32;
 pub mod usermode;
 pub mod hda;
 pub mod net;
+pub mod syscall;
 
 #[repr(C)]
 pub struct BootInfo {
@@ -41,8 +42,25 @@ pub static mut AUDIO_DRIVE: Option<hda::IntelHda> = None;
 
 // --- THE RING-3 SANDBOX APP ---
 extern "C" fn ring3_user_task() -> ! {
+    let msg = "\n> [RING-3]: HELLO FROM THE USERSPACE SANDBOX! SYSCALL EXECUTED.\n";
+    let ptr = msg.as_ptr() as u64;
+    let len = msg.len() as u64;
+    let color = 0xF59E0B; 
+
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 1,      
+            in("rdi") ptr,    
+            in("rsi") len,    
+            in("rdx") color,  
+            out("rcx") _,     
+            out("r11") _,     
+        );
+    }
+
     loop {
-        // Spinning safely in the Ring-3 Sandbox...
+        unsafe { core::arch::asm!("pause"); }
     }
 }
 
@@ -68,7 +86,6 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     let mut xhci_found = false;
     let mut _xhci_bar0: u64 = 0; 
     
-    // Audio hardware tracking
     let mut hda_found = false;
     let mut hda_bar0: u64 = 0;
 
@@ -108,28 +125,25 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                             let subclass = unsafe { core::ptr::read_volatile((pci_addr + 0x0A) as *const u8) };
                             let prog_if = unsafe { core::ptr::read_volatile((pci_addr + 0x09) as *const u8) };
                             
-                            // --- UPGRADE: E1000 BUS MASTERING ENABLE ---
                             if class_code == 0x02 && subclass == 0x00 {
                                 let bar0_raw = unsafe { core::ptr::read_volatile((pci_addr + 0x10) as *const u32) };
                                 e1000_bar0 = Some((bar0_raw & 0xFFFFFFF0) as u64);
                                 
-                                // FORCE ENABLE BUS MASTERING (Allows NIC to write packets to RAM!)
                                 let cmd_addr = (pci_addr + 0x04) as *mut u16;
                                 let mut cmd = unsafe { core::ptr::read_volatile(cmd_addr) };
                                 cmd |= (1 << 1) | (1 << 2); 
                                 unsafe { core::ptr::write_volatile(cmd_addr, cmd); }
                             }
 
-                            // --- NVMe Check ---
                             if class_code == 0x01 && subclass == 0x08 { 
                                 nvme_found = true; 
                                 let bar0_raw = unsafe { core::ptr::read_volatile((pci_addr + 0x10) as *const u32) };
                                 let bar_type = (bar0_raw >> 1) & 0x03;
                                 
-                                if bar_type == 2 { // 64-bit BAR
+                                if bar_type == 2 { 
                                     let bar1_raw = unsafe { core::ptr::read_volatile((pci_addr + 0x14) as *const u32) };
                                     nvme_bar0 = ((bar1_raw as u64) << 32) | ((bar0_raw & 0xFFFFFFF0) as u64);
-                                } else { // 32-bit BAR
+                                } else { 
                                     nvme_bar0 = (bar0_raw & 0xFFFFFFF0) as u64;
                                 }
 
@@ -139,16 +153,15 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                                 unsafe { core::ptr::write_volatile(cmd_addr, cmd); }
                             }
                             
-                            // --- Intel HDA Check ---
                             if class_code == 0x04 && subclass == 0x03 {
                                 hda_found = true;
                                 let bar0_raw = unsafe { core::ptr::read_volatile((pci_addr + 0x10) as *const u32) };
                                 let bar_type = (bar0_raw >> 1) & 0x03;
                                 
-                                if bar_type == 2 { // 64-bit BAR
+                                if bar_type == 2 { 
                                     let bar1_raw = unsafe { core::ptr::read_volatile((pci_addr + 0x14) as *const u32) };
                                     hda_bar0 = ((bar1_raw as u64) << 32) | ((bar0_raw & 0xFFFFFFF0) as u64);
-                                } else { // 32-bit BAR
+                                } else { 
                                     hda_bar0 = (bar0_raw & 0xFFFFFFF0) as u64;
                                 }
 
@@ -158,7 +171,6 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                                 unsafe { core::ptr::write_volatile(cmd_addr, cmd); }
                             }
                             
-                            // --- xHCI USB Check ---
                             if class_code == 0x0C && subclass == 0x03 && prog_if == 0x30 { 
                                 xhci_found = true; 
                                 let bar0_raw = unsafe { core::ptr::read_volatile((pci_addr + 0x10) as *const u32) };
@@ -192,6 +204,12 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         gdt::init();  
         interrupts::init_idt();
 
+        let k_code = gdt::GDT.1.code_selector.0;
+        let k_data = gdt::GDT.1.data_selector.0;
+        let u_code = gdt::GDT.1.user_code.0;
+        let u_data = gdt::GDT.1.user_data.0;
+        syscall::init(k_code, k_data, u_code, u_data);
+
         if let Some(bar0) = e1000_bar0 {
             let mut nic = e1000::E1000::new(bar0);
             nic.init_rx_ring();
@@ -214,7 +232,6 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         mouse::init();
         x86_64::instructions::interrupts::enable();
 
-        // COMPOSITOR INIT
         compositor::init(boot_info);
         compositor::fill_rect(0, 0, compositor::SERVER.width, compositor::SERVER.height, 0xFFFFFF);
         compositor::fill_rect(0, 0, compositor::SERVER.width, 40, 0x1E293B);
@@ -223,12 +240,10 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         compositor::terminal_print("INIT: Core 0 (BSP) Online.\n", 0x10B981);
         compositor::terminal_print("INIT: APIC Interrupt Routing Established.\n", 0x10B981);
         
-        // Confirm E1000 Bus Mastering is active!
         if e1000_bar0.is_some() {
             compositor::terminal_print("ECAM: E1000 Network Card Found & Bus Master Enabled!\n", 0x3B82F6);
         }
 
-        // NVME INIT
         if nvme_found && nvme_bar0 != 0 { 
             compositor::terminal_print("ECAM: NVMe Direct Storage Controller Found!\n", 0x3B82F6); 
             let mut drive = nvme::Nvme::new(nvme_bar0);
@@ -274,10 +289,8 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
             NVME_DRIVE = Some(drive);
         }
 
-        // --- LINK FAT32 TO NETWORK STACK ---
         crate::net::HTTP_PAYLOAD = Some(sector_data_str.clone());
 
-        // AUDIO INIT
         if hda_found && hda_bar0 != 0 {
             let mut hda = hda::IntelHda::new(hda_bar0);
             hda.init();
@@ -291,16 +304,12 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         compositor::terminal_print("\n> READY: WAITING FOR INCOMING TCP CONNECTIONS\n> ", 0x1E293B);
     }
 
-    // --- AUTOMATIC FIREWALL HANDSHAKE ---
     unsafe {
         if let Some(ref mut nic) = NET_CARD {
-            nic.arp_request([10, 0, 2, 2]); // Pings QEMU Router automatically on boot!
+            nic.arp_request([10, 0, 2, 2]); 
         }
     }
 
-    // ---------------------------------------------------------
-    // THE QOREOS MAIN IDLE LOOP
-    // ---------------------------------------------------------
     let mut old_mbtn = 0;
     let mut desktop_win = compositor::Window::new(100, 200, 600, 300, "EDGECORE DIAGNOSTICS", 0x334155);
     
@@ -339,13 +348,24 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                     compositor::terminal_print("\n> [WARNING] EJECTING FROM KERNEL MODE. DROPPING TO RING-3...\n", 0xEF4444);
                     if let Some(ref canvas) = compositor::SERVER.terminal_layer { compositor::blit_canvas(canvas); }
                     
-                    static mut USER_STACK: [u8; 4096 * 4] = [0; 4096 * 4];
-                    let stack_ptr = USER_STACK.as_ptr() as u64 + (4096 * 4);
+                    #[repr(align(16))]
+                    struct UserStack([u8; 4096 * 4]);
+                    static mut USER_STACK: UserStack = UserStack([0; 4096 * 4]);
+                    let stack_ptr = USER_STACK.0.as_ptr() as u64 + (4096 * 4);
                     
-                    let code_selector = gdt::GDT.1.user_code.0;
-                    let data_selector = gdt::GDT.1.user_data.0;
+                    let u_code = (gdt::GDT.1.user_code.0 & 0xFFFC) | 3;
+                    let u_data = (gdt::GDT.1.user_data.0 & 0xFFFC) | 3;
 
-                    usermode::drop_to_usermode(code_selector, data_selector, ring3_user_task as *const () as u64, stack_ptr);
+                    compositor::terminal_print("> SYS: DISABLING CR0.WP & UNLOCKING MMU...\n", 0xF59E0B);
+                    if let Some(ref canvas) = compositor::SERVER.terminal_layer { compositor::blit_canvas(canvas); }
+
+                    unlock_mmu_for_ring3();
+
+                    compositor::terminal_print("> SYS: MMU UNLOCKED! FIRING IRETQ...\n", 0x10B981);
+                    if let Some(ref canvas) = compositor::SERVER.terminal_layer { compositor::blit_canvas(canvas); }
+
+                    // --- PASS AS U64 FIX ---
+                    usermode::drop_to_usermode(u_code as u64, u_data as u64, ring3_user_task as *const () as u64, stack_ptr);
                 }
                 else if left_click {
                     if !is_dragging {
@@ -408,6 +428,57 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         }
         x86_64::instructions::hlt(); 
     }
+}
+
+pub unsafe fn unlock_mmu_for_ring3() {
+    let mut cr0: u64;
+    core::arch::asm!("mov {}, cr0", out(reg) cr0);
+    let old_cr0 = cr0;
+    cr0 &= !(1 << 16); 
+    core::arch::asm!("mov cr0, {}", in(reg) cr0);
+
+    let (pml4_frame, _) = x86_64::registers::control::Cr3::read();
+    let pml4_ptr = pml4_frame.start_address().as_u64() as *mut u64;
+
+    for i in 0..512 {
+        let pml4_entry = core::ptr::read_volatile(pml4_ptr.add(i));
+        if (pml4_entry & 1) != 0 { 
+            core::ptr::write_volatile(pml4_ptr.add(i), pml4_entry | 0x4); 
+
+            if (pml4_entry & 0x80) == 0 { 
+                let pdpt_ptr = (pml4_entry & 0x000FFFFFFFFFF000) as *mut u64;
+                for j in 0..512 {
+                    let pdpt_entry = core::ptr::read_volatile(pdpt_ptr.add(j));
+                    if (pdpt_entry & 1) != 0 { 
+                        core::ptr::write_volatile(pdpt_ptr.add(j), pdpt_entry | 0x4); 
+
+                        if (pdpt_entry & 0x80) == 0 { 
+                            let pd_ptr = (pdpt_entry & 0x000FFFFFFFFFF000) as *mut u64;
+                            for k in 0..512 {
+                                let pd_entry = core::ptr::read_volatile(pd_ptr.add(k));
+                                if (pd_entry & 1) != 0 { 
+                                    core::ptr::write_volatile(pd_ptr.add(k), pd_entry | 0x4); 
+
+                                    if (pd_entry & 0x80) == 0 { 
+                                        let pt_ptr = (pd_entry & 0x000FFFFFFFFFF000) as *mut u64;
+                                        for l in 0..512 {
+                                            let pt_entry = core::ptr::read_volatile(pt_ptr.add(l));
+                                            if (pt_entry & 1) != 0 { 
+                                                core::ptr::write_volatile(pt_ptr.add(l), pt_entry | 0x4); 
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    core::arch::asm!("mov cr0, {}", in(reg) old_cr0);
+    x86_64::instructions::tlb::flush_all(); 
 }
 
 #[panic_handler]
