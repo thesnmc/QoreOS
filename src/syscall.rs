@@ -1,7 +1,8 @@
 use core::arch::naked_asm;
 use core::arch::asm;
+use crate::compositor::Canvas;
+use alloc::boxed::Box;
 
-// MSR Addresses for Syscall Configuration
 const MSR_EFER: u32 = 0xC0000080;
 const MSR_STAR: u32 = 0xC0000081;
 const MSR_LSTAR: u32 = 0xC0000082;
@@ -38,29 +39,29 @@ extern "C" fn syscall_entry() {
             "push rax", "push rdi", "push rsi", "push rdx",
             "push r8", "push r9", "push r10",
 
-            // --- THE ABI ALIGNMENT FIX ---
-            // Shift registers FIRST before we overwrite RAX with the Data Segment!
-            "mov rcx, rdx",  // arg4 = arg3 (color)
-            "mov rdx, rsi",  // arg3 = arg2 (len)
-            "mov rsi, rdi",  // arg2 = arg1 (ptr)
-            "mov rdi, rax",  // arg1 = syscall_num
+            "mov rcx, rdx",  
+            "mov rdx, rsi",  
+            "mov rsi, rdi",  
+            "mov rdi, rax",  
 
-            // Now safely save Ring-3 Data Segments
             "mov ax, ds",
             "push rax",
             
-            // Load Ring-0 Kernel Data Segment (0x10)
             "mov ax, 0x10",
             "mov ds, ax", "mov es, ax", "mov fs, ax", "mov gs, ax",
 
             "call {handler}",
 
+            "mov r12, rax",
+
             "pop rax",
             "mov ds, ax", "mov es, ax", "mov fs, ax", "mov gs, ax",
 
             "pop r10", "pop r9", "pop r8",
-            "pop rdx", "pop rsi", "pop rdi", "pop rax", // Pops the ORIGINAL rax (1) back perfectly!
+            "pop rdx", "pop rsi", "pop rdi", "pop rax", 
             
+            "mov rax, r12",
+
             "pop r11", "pop rcx",
             "sysretq",
             handler = sym syscall_handler
@@ -68,25 +69,44 @@ extern "C" fn syscall_entry() {
     }
 }
 
-extern "C" fn syscall_handler(syscall_num: u64, arg1: u64, arg2: u64, arg3: u64) {
+extern "C" fn syscall_handler(syscall_num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     unsafe {
-        if syscall_num == 1 {
-            let str_ptr = arg1 as *const u8;
-            let str_len = arg2 as usize;
-            let color = arg3 as u32;
-            
-            let slice = core::slice::from_raw_parts(str_ptr, str_len);
-            if let Ok(text) = core::str::from_utf8(slice) {
-                crate::compositor::terminal_print(text, color);
-            } else {
-                crate::compositor::terminal_print("\n> SYS: SYSCALL STRING UTF8 ERROR!\n", 0xEF4444);
+        match syscall_num {
+            1 => {
+                let str_ptr = arg1 as *const u8;
+                let str_len = arg2 as usize;
+                let color = arg3 as u32;
+                let slice = core::slice::from_raw_parts(str_ptr, str_len);
+                if let Ok(text) = core::str::from_utf8(slice) {
+                    crate::compositor::terminal_print(text, color);
+                } else {
+                    crate::compositor::terminal_print("\n> SYS: SYSCALL STRING UTF8 ERROR!\n", 0xEF4444);
+                }
+                0
+            },
+            2 => {
+                let x = arg1 as usize;
+                let y = arg2 as usize;
+                let size = arg3 as usize;
+                
+                // Allocate the safe, flat array inside the Canvas struct
+                let canvas = Box::new(Canvas::new(x, y, size, size, 0x000000));
+                
+                // Return the pointer to the heap-allocated Canvas
+                Box::into_raw(canvas) as u64
+            },
+            3 => {
+                let canvas_ptr = arg1 as *const Canvas;
+                if !canvas_ptr.is_null() {
+                    let canvas = &*canvas_ptr;
+                    crate::compositor::blit_canvas(canvas);
+                }
+                0
+            },
+            _ => {
+                crate::compositor::terminal_print("\n> SYS: UNKNOWN SYSCALL TRIGGERED!\n", 0xEF4444);
+                0
             }
-        } else {
-            crate::compositor::terminal_print("\n> SYS: UNKNOWN SYSCALL TRIGGERED!\n", 0xEF4444);
-        }
-
-        if let Some(ref canvas) = crate::compositor::SERVER.terminal_layer {
-            crate::compositor::blit_canvas(canvas);
         }
     }
 }

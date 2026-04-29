@@ -41,19 +41,71 @@ pub static mut NVME_DRIVE: Option<nvme::Nvme> = None;
 pub static mut AUDIO_DRIVE: Option<hda::IntelHda> = None;
 
 // --- THE RING-3 SANDBOX APP ---
+// --- THE RING-3 SANDBOX APP ---
 extern "C" fn ring3_user_task() -> ! {
-    let msg = "\n> [RING-3]: HELLO FROM THE USERSPACE SANDBOX! SYSCALL EXECUTED.\n";
+    let msg = "\n> [RING-3]: USER APP BOOTED. REQUESTING UI CANVAS...\n";
     let ptr = msg.as_ptr() as u64;
     let len = msg.len() as u64;
     let color = 0xF59E0B; 
 
     unsafe {
+        // Syscall 1: Print Boot Message
         core::arch::asm!(
             "syscall",
-            in("rax") 1,      
+            in("rax") 1u64,      
             in("rdi") ptr,    
             in("rsi") len,    
             in("rdx") color,  
+            out("rcx") _,     
+            out("r11") _,     
+        );
+
+        // Syscall 2: Request Canvas (Moved to Top Right: x=400, y=100)
+        let mut canvas_ptr: u64 = 2; 
+        core::arch::asm!(
+            "syscall",
+            inout("rax") canvas_ptr,     
+            in("rdi") 400u64,    
+            in("rsi") 100u64,    
+            in("rdx") 200u64,  
+            out("rcx") _,     
+            out("r11") _,     
+        );
+
+        // Cast pointer back to Canvas struct
+        let canvas = &mut *(canvas_ptr as *mut compositor::Canvas);
+        let pixel_buffer = canvas.pixels.as_mut_ptr();
+
+        // Draw a User-Space Gradient!
+        for y in 0..200 {
+            for x in 0..200 {
+                let r = (x as u32) & 0xFF;
+                let b = (y as u32) & 0xFF;
+                let color = (r << 16) | (0 << 8) | b;
+                
+                let offset = (y * 200) + x;
+                pixel_buffer.add(offset).write_volatile(color);
+            }
+        }
+
+        // --- THE FIX: PRINT THE TEXT FIRST! ---
+        let success_msg = "\n> [RING-3]: CANVAS ALLOCATED. RENDERING GRAPHICS...\n";
+        core::arch::asm!(
+            "syscall",
+            in("rax") 1u64,      
+            in("rdi") success_msg.as_ptr() as u64,    
+            in("rsi") success_msg.len() as u64,    
+            in("rdx") 0x10B981u32 as u64,  
+            out("rcx") _,     
+            out("r11") _,     
+        );
+
+        // --- THE FIX: RENDER THE CANVAS SECOND SO IT OVERLAYS THE TERMINAL! ---
+        // Syscall 3: Ask the Ring-0 Compositor to Render the Canvas to the Screen
+        core::arch::asm!(
+            "syscall",
+            in("rax") 3u64,      
+            in("rdi") canvas_ptr,    
             out("rcx") _,     
             out("r11") _,     
         );
@@ -364,7 +416,6 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
                     compositor::terminal_print("> SYS: MMU UNLOCKED! FIRING IRETQ...\n", 0x10B981);
                     if let Some(ref canvas) = compositor::SERVER.terminal_layer { compositor::blit_canvas(canvas); }
 
-                    // --- PASS AS U64 FIX ---
                     usermode::drop_to_usermode(u_code as u64, u_data as u64, ring3_user_task as *const () as u64, stack_ptr);
                 }
                 else if left_click {
