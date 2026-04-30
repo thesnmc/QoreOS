@@ -41,73 +41,56 @@ pub static mut NVME_DRIVE: Option<nvme::Nvme> = None;
 pub static mut AUDIO_DRIVE: Option<hda::IntelHda> = None;
 
 // --- THE RING-3 SANDBOX APP ---
-// --- THE RING-3 SANDBOX APP ---
 extern "C" fn ring3_user_task() -> ! {
-    let msg = "\n> [RING-3]: USER APP BOOTED. REQUESTING UI CANVAS...\n";
-    let ptr = msg.as_ptr() as u64;
-    let len = msg.len() as u64;
-    let color = 0xF59E0B; 
-
+    let msg = "\n> [RING-3]: USER APP BOOTED. INITIATING NVME HARDWARE READ...\n";
+    
     unsafe {
         // Syscall 1: Print Boot Message
         core::arch::asm!(
             "syscall",
             in("rax") 1u64,      
-            in("rdi") ptr,    
-            in("rsi") len,    
-            in("rdx") color,  
-            out("rcx") _,     
-            out("r11") _,     
+            in("rdi") msg.as_ptr() as u64,    
+            in("rsi") msg.len() as u64,    
+            in("rdx") 0xF59E0B_u32 as u64,  
+            out("rcx") _, out("r11") _,     
         );
 
-        // Syscall 2: Request Canvas (Moved to Top Right: x=400, y=100)
-        let mut canvas_ptr: u64 = 2; 
+        // Syscall 4: Request NVMe Read of Sector 0
+        let sector_ptr: u64; 
         core::arch::asm!(
             "syscall",
-            inout("rax") canvas_ptr,     
-            in("rdi") 400u64,    
-            in("rsi") 100u64,    
-            in("rdx") 200u64,  
-            out("rcx") _,     
-            out("r11") _,     
+            inout("rax") 4u64 => sector_ptr,     
+            in("rdi") 0u64, // LBA 0
+            out("rcx") _, out("r11") _,     
         );
 
-        // Cast pointer back to Canvas struct
-        let canvas = &mut *(canvas_ptr as *mut compositor::Canvas);
-        let pixel_buffer = canvas.pixels.as_mut_ptr();
-
-        // Draw a User-Space Gradient!
-        for y in 0..200 {
-            for x in 0..200 {
-                let r = (x as u32) & 0xFF;
-                let b = (y as u32) & 0xFF;
-                let color = (r << 16) | (0 << 8) | b;
-                
-                let offset = (y * 200) + x;
-                pixel_buffer.add(offset).write_volatile(color);
-            }
+        // Extract bytes 3 to 10 from Sector 0 (FAT32 OEM Name)
+        let data = core::slice::from_raw_parts((sector_ptr + 3) as *const u8, 8);
+        
+        let mut network_payload = alloc::string::String::from("RING-3 FOUND DISK SIGNATURE: ");
+        if let Ok(sig) = core::str::from_utf8(data) {
+            network_payload.push_str(sig);
+        } else {
+            network_payload.push_str("CORRUPT");
         }
 
-        // --- THE FIX: PRINT THE TEXT FIRST! ---
-        let success_msg = "\n> [RING-3]: CANVAS ALLOCATED. RENDERING GRAPHICS...\n";
+        // Syscall 5: Broadcast finding via e1000
+        core::arch::asm!(
+            "syscall",
+            in("rax") 5u64,      
+            in("rdi") network_payload.as_ptr() as u64,    
+            in("rsi") network_payload.len() as u64,    
+            out("rcx") _, out("r11") _,     
+        );
+
+        let success_msg = "> [RING-3]: MISSION COMPLETE. ENTERING IDLE LOOP.\n";
         core::arch::asm!(
             "syscall",
             in("rax") 1u64,      
             in("rdi") success_msg.as_ptr() as u64,    
             in("rsi") success_msg.len() as u64,    
-            in("rdx") 0x10B981u32 as u64,  
-            out("rcx") _,     
-            out("r11") _,     
-        );
-
-        // --- THE FIX: RENDER THE CANVAS SECOND SO IT OVERLAYS THE TERMINAL! ---
-        // Syscall 3: Ask the Ring-0 Compositor to Render the Canvas to the Screen
-        core::arch::asm!(
-            "syscall",
-            in("rax") 3u64,      
-            in("rdi") canvas_ptr,    
-            out("rcx") _,     
-            out("r11") _,     
+            in("rdx") 0x10B981_u32 as u64,  
+            out("rcx") _, out("r11") _,     
         );
     }
 

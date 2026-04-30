@@ -2,6 +2,7 @@ use core::arch::naked_asm;
 use core::arch::asm;
 use crate::compositor::Canvas;
 use alloc::boxed::Box;
+use alloc::string::String;
 
 const MSR_EFER: u32 = 0xC0000080;
 const MSR_STAR: u32 = 0xC0000081;
@@ -88,11 +89,7 @@ extern "C" fn syscall_handler(syscall_num: u64, arg1: u64, arg2: u64, arg3: u64)
                 let x = arg1 as usize;
                 let y = arg2 as usize;
                 let size = arg3 as usize;
-                
-                // Allocate the safe, flat array inside the Canvas struct
                 let canvas = Box::new(Canvas::new(x, y, size, size, 0x000000));
-                
-                // Return the pointer to the heap-allocated Canvas
                 Box::into_raw(canvas) as u64
             },
             3 => {
@@ -101,6 +98,49 @@ extern "C" fn syscall_handler(syscall_num: u64, arg1: u64, arg2: u64, arg3: u64)
                     let canvas = &*canvas_ptr;
                     crate::compositor::blit_canvas(canvas);
                 }
+                0
+            },
+            4 => {
+                // --- Read NVMe Sector ---
+                let lba = arg1;
+                crate::compositor::terminal_print("\n> SYS: RING-3 NVME READ REQUEST ACCEPTED.\n", 0xF59E0B);
+                
+                if let Some(ref mut drive) = crate::NVME_DRIVE {
+                    let data = drive.read_sector(lba);
+                    let mut safe_buffer: Box<[u8; 512]> = Box::new([0; 512]);
+                    safe_buffer.copy_from_slice(&data);
+                    
+                    crate::compositor::terminal_print("> SYS: NVME DMA COMPLETE. PASSING POINTER TO RING-3.\n", 0x10B981);
+                    if let Some(ref canvas) = crate::compositor::SERVER.terminal_layer { crate::compositor::blit_canvas(canvas); }
+                    
+                    Box::into_raw(safe_buffer) as u64 
+                } else {
+                    crate::compositor::terminal_print("> SYS: NVME DRIVE NOT FOUND!\n", 0xEF4444);
+                    0
+                }
+            },
+            5 => {
+                // --- Send Network Packet ---
+                let str_ptr = arg1 as *const u8;
+                let str_len = arg2 as usize;
+                let slice = core::slice::from_raw_parts(str_ptr, str_len);
+                
+                if let Ok(text) = core::str::from_utf8(slice) {
+                    let log = alloc::format!("\n> SYS: RING-3 NETWORK REQUEST. PAYLOAD: '{}'\n", text);
+                    crate::compositor::terminal_print(&log, 0xF59E0B);
+                    
+                    if let Some(ref mut nic) = crate::NET_CARD {
+                        // The TCP stack isn't built yet, so we use arp_request to prove 
+                        // we can trigger the hardware TX ring from User Space!
+                        let dest_ip = [10, 0, 2, 2];
+                        nic.arp_request(dest_ip);
+                        
+                        crate::compositor::terminal_print("> SYS: E1000 HARDWARE TRANSMIT (TX) COMPLETE!\n", 0x10B981);
+                    } else {
+                        crate::compositor::terminal_print("> SYS: E1000 NETWORK CARD NOT FOUND!\n", 0xEF4444);
+                    }
+                }
+                if let Some(ref canvas) = crate::compositor::SERVER.terminal_layer { crate::compositor::blit_canvas(canvas); }
                 0
             },
             _ => {
