@@ -21,6 +21,7 @@ pub mod usermode;
 pub mod hda;
 pub mod net;
 pub mod syscall;
+pub mod smp; 
 
 #[repr(C)]
 pub struct BootInfo {
@@ -45,7 +46,6 @@ extern "C" fn ring3_user_task() -> ! {
     let msg = "\n> [RING-3]: USER APP BOOTED. INITIATING NVME HARDWARE READ...\n";
     
     unsafe {
-        // Syscall 1: Print Boot Message
         core::arch::asm!(
             "syscall",
             in("rax") 1u64,      
@@ -55,7 +55,6 @@ extern "C" fn ring3_user_task() -> ! {
             out("rcx") _, out("r11") _,     
         );
 
-        // Syscall 4: Request NVMe Read of Sector 0
         let sector_ptr: u64; 
         core::arch::asm!(
             "syscall",
@@ -64,7 +63,6 @@ extern "C" fn ring3_user_task() -> ! {
             out("rcx") _, out("r11") _,     
         );
 
-        // Extract bytes 3 to 10 from Sector 0 (FAT32 OEM Name)
         let data = core::slice::from_raw_parts((sector_ptr + 3) as *const u8, 8);
         
         let mut network_payload = alloc::string::String::from("RING-3 FOUND DISK SIGNATURE: ");
@@ -74,7 +72,6 @@ extern "C" fn ring3_user_task() -> ! {
             network_payload.push_str("CORRUPT");
         }
 
-        // Syscall 5: Broadcast finding via e1000
         core::arch::asm!(
             "syscall",
             in("rax") 5u64,      
@@ -102,6 +99,17 @@ extern "C" fn ring3_user_task() -> ! {
 #[unsafe(no_mangle)]
 pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     x86_64::instructions::interrupts::disable();
+
+    // ====================================================================
+    // --- THE FIX: UNBREAKABLE CPUID HARDWARE LOCK ---
+    // This safely reads the core ID. If it's an AP core (not 0), it HALTS.
+    let cpuid = unsafe { core::arch::x86_64::__cpuid(1) };
+    let apic_id = (cpuid.ebx >> 24) & 0xFF;
+    if apic_id != 0 {
+        loop { unsafe { core::arch::asm!("cli; hlt"); } }
+    }
+    // ====================================================================
+
     let info = unsafe { &*boot_info };
 
     let fb_ptr = info.framebuffer_base as *mut u8;
@@ -257,13 +265,6 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         let mut ps2_cmd = x86_64::instructions::port::Port::<u8>::new(0x64);
         ps2_cmd.write(0xAE); 
 
-        if local_apic_base != 0 {
-            let icr_low = (local_apic_base + 0x300) as *mut u32;
-            core::ptr::write_volatile(icr_low, 0x000C4500);
-            for _ in 0..10_000 { core::arch::asm!("nop"); } 
-            core::ptr::write_volatile(icr_low, 0x000C4608);
-        }
-
         mouse::init();
         x86_64::instructions::interrupts::enable();
 
@@ -274,6 +275,35 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
 
         compositor::terminal_print("INIT: Core 0 (BSP) Online.\n", 0x10B981);
         compositor::terminal_print("INIT: APIC Interrupt Routing Established.\n", 0x10B981);
+
+        // --- THE FLAWLESS APIC WAKEUP SEQUENCE ---
+        if local_apic_base != 0 {
+            compositor::terminal_print("SMP: Copying AP Trampoline to Safe Zone 0x8000...\n", 0xF59E0B);
+            smp::copy_trampoline();
+
+            let icr_low = (local_apic_base + 0x300) as *mut u32;
+            let icr_high = (local_apic_base + 0x310) as *mut u32;
+
+            compositor::terminal_print("SMP: Firing INIT IPI to all Application Processors...\n", 0xF59E0B);
+            // Fire INIT to ALL cores excluding self
+            core::ptr::write_volatile(icr_high, 0); 
+            core::ptr::write_volatile(icr_low, 0x000C4500);
+            
+            // Give cores time to process INIT
+            for _ in 0..100_000 { core::arch::asm!("nop"); } 
+            
+            compositor::terminal_print("SMP: Firing SIPI (Vector 0x08) to awaken APs...\n", 0x10B981);
+            
+            // --- FIRE SIPI WITH VECTOR 0x08 (0x8000) ---
+            core::ptr::write_volatile(icr_low, 0x000C4608);
+
+            // Give cores time to transition to 64-bit and hit the Atomic Counter
+            for _ in 0..500_000 { core::arch::asm!("nop"); } 
+
+            let active_aps = smp::AP_COUNT.load(core::sync::atomic::Ordering::SeqCst);
+            let smp_msg = alloc::format!("> SMP: {} APPLICATION PROCESSORS SUCCESSFULLY AWAKENED!\n", active_aps);
+            compositor::terminal_print(&smp_msg, 0x10B981);
+        }
         
         if e1000_bar0.is_some() {
             compositor::terminal_print("ECAM: E1000 Network Card Found & Bus Master Enabled!\n", 0x3B82F6);
@@ -335,7 +365,6 @@ pub extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
 
         if xhci_found { compositor::terminal_print("ECAM: xHCI Extensible Host Controller Found!\n", 0x3B82F6); }
         
-        compositor::terminal_print("SMP: INIT-SIPI IPI Broadcast Transmitted to AP Cores.\n", 0x3B82F6);
         compositor::terminal_print("\n> READY: WAITING FOR INCOMING TCP CONNECTIONS\n> ", 0x1E293B);
     }
 
